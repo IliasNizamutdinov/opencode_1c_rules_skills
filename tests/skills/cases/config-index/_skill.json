@@ -1,0 +1,22 @@
+{
+  "script": "config-index/scripts/config-index",
+  "setup": "none",
+  "args": [
+    {
+      "flag": "-IndexPath",
+      "from": "workPath",
+      "field": "indexPath",
+      "optional": true
+    },
+    {
+      "flag": "-OutFile",
+      "from": "workPath",
+      "field": "outFile",
+      "optional": true
+    }
+  ],
+  "snapshot": {
+    "root": "workDir",
+    "normalizeUuids": false
+  }
+}

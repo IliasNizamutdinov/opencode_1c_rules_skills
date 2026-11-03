@@ -1,0 +1,538 @@
+#!/usr/bin/env python3
+# db-update v1.0 - Update 1C database configuration
+# Source: https://github.com/Desko77/claude-code-skills-1c
+
+import argparse
+import glob
+import os
+import random
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+# --- Вердикт платформы (общий блок, версия 1) ---
+# Платформа сообщает результат тремя независимыми каналами, и ни один не самодостаточен:
+# нулевой код возврата при проваленной операции - ее штатное поведение. Четвертый сигнал -
+# постусловие: артефакт операции действительно появился и он от этого запуска.
+
+# Фразы, которыми платформа сообщает об ОТСУТСТВИИ проблем. Сверяются раньше диагностики
+# и целиком: строка "операция завершена с ошибками" не должна попасть под "операция завершена".
+PLATFORM_CLEAN_PHRASES = (
+    "ошибок не обнаружено",
+    "ошибки не обнаружены",
+    "предупреждений не обнаружено",
+    "ошибок: 0",
+    "предупреждений: 0",
+    "errors were not found",
+    "0 errors",
+)
+
+# Сообщения, при которых операция провалена, даже если код возврата нулевой.
+PLATFORM_FATAL_PHRASES = (
+    "неверное свойство объекта метаданных",
+    "не входит в состав объекта метаданных",
+    "неизвестное имя типа",
+    "неизвестный объект метаданных",
+    "ни один из документов не является регистратором для регистра",
+    "неверное значение перечисления",
+    "не может быть приведен к типу",
+    "необходима версия платформы не меньше",
+    "не найден метод",
+    "не может быть применен",
+)
+
+
+def hide_platform_secret(text):
+    """Замаскировать секреты в строке, уходящей в вывод."""
+    if not text:
+        return text
+    # Ключи с секретом: пароль базы, код разблокировки, пароль хранилища конфигурации.
+    # Длинные имена стоят первыми, иначе короткое подойдет как префикс длинного.
+    keys = r'(?:^|(?<=\s))(/ConfigurationRepositoryP|/UC|/P)'
+    masked = re.sub(keys + r'"[^"]*"', r'\g<1>"***"', text)
+    masked = re.sub(keys + r'([^\s"]\S*)', r'\g<1>***', masked)
+    # Утилита администрирования принимает секрет длинным ключом со знаком равенства:
+    # --token=, --password=, --db-pwd=. Правило для ключей платформы их не покрывает.
+    long_keys = r'(?:^|(?<=\s))(--(?:token|password|db-pwd|pwd)=)'
+    masked = re.sub(long_keys + r'"[^"]*"', r'\g<1>"***"', masked)
+    masked = re.sub(long_keys + r'([^\s"]\S*)', r'\g<1>***', masked)
+    return masked
+
+
+def platform_log_problems(log_text):
+    """Строки лога, означающие провал операции при любом коде возврата."""
+    problems = []
+    if not log_text:
+        return problems
+    for line in log_text.splitlines():
+        trimmed = line.strip()
+        if not trimmed:
+            continue
+        lower = trimmed.lower()
+        if any(phrase in lower for phrase in PLATFORM_CLEAN_PHRASES):
+            continue
+        if any(phrase in lower for phrase in PLATFORM_FATAL_PHRASES):
+            problems.append(trimmed)
+    return problems
+
+
+def platform_result_code(result_file):
+    """Числовой результат платформы или None, если сигнал недоступен."""
+    if not result_file or not os.path.isfile(result_file):
+        return None
+    try:
+        with open(result_file, "r", encoding="utf-8-sig") as f:
+            raw = f.read().strip()
+    except Exception:
+        return None
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+def write_platform_verdict(exit_code, result_file, log_text, success_message,
+                           failure_message, artifact_path=None, strict=False):
+    """Свести четыре сигнала в один код возврата и напечатать вердикт."""
+    final_code = exit_code
+    result_code = platform_result_code(result_file)
+    if result_code is not None and result_code != 0 and final_code == 0:
+        print(f"[error] platform result code: {result_code}", file=sys.stderr)
+        final_code = 1
+
+    if final_code == 0:
+        print(success_message)
+    else:
+        print(f"{failure_message} (code: {final_code})", file=sys.stderr)
+
+    if log_text:
+        print("--- Log ---")
+        print(log_text)
+        print("--- End ---")
+
+    problems = platform_log_problems(log_text)
+    if problems:
+        print(f"[warning] platform reported success, but the log contains {len(problems)} problem(s):")
+        for problem in problems:
+            print(f"  {problem}")
+        if strict and final_code == 0:
+            final_code = 1
+
+    if artifact_path and final_code == 0 and not os.path.exists(artifact_path):
+        print(f"[error] platform reported success, but the expected result is missing: {artifact_path}",
+              file=sys.stderr)
+        final_code = 1
+
+    return final_code
+# --- Конец общего блока вердикта платформы ---
+
+# --- Защита боевой базы (общий блок, версия 2) ---
+# База, помеченная в .v8-project.json как боевая (role: prod), отказывает изменяющей
+# операции, пока не передан --allow-prod. Отказ стоит одной команды, а неудачная загрузка в
+# боевую базу необратима. Проверка идет до запуска платформы; когда файла настроек нет,
+# записи базы нет или роль отличается от prod - поведение прежнее.
+def find_v8_project_file(start_dir):
+    """Файл настроек проекта вверх по дереву от целевого каталога.
+
+    Существование каталога не требуется: подъем идет по строке пути, а целевого каталога
+    на момент создания базы еще нет.
+    """
+    d = os.path.abspath(start_dir)
+    for _ in range(20):
+        candidate = os.path.join(d, ".v8-project.json")
+        if os.path.isfile(candidate):
+            return candidate
+        parent = os.path.dirname(d)
+        if parent == d:
+            break
+        d = parent
+    return None
+
+
+def info_base_server_key(value):
+    """Ключ сравнения адреса сервера.
+
+    Порт кластера по умолчанию 1541 отбрасывается: srv01 и srv01:1541 - одна база.
+    Другой порт остается в ключе и отличает базу.
+    """
+    text = str(value or "").strip().lower()
+    suffix = ":1541"
+    if text.endswith(suffix):
+        text = text[: -len(suffix)]
+    return text
+
+
+def info_base_record_kind(db):
+    """Вид записи реестра.
+
+    Поле type учитывается, когда оно задано (server или file). Иначе серверная запись -
+    это пара server и ref, файловая - путь.
+    """
+    declared = str(db.get("type") or "").strip().lower()
+    if declared in ("server", "file"):
+        return declared
+    if str(db.get("server") or "").strip() and str(db.get("ref") or "").strip():
+        return "server"
+    if str(db.get("path") or "").strip():
+        return "file"
+    return ""
+
+
+def info_base_path_key(value, base_dir):
+    """Ключ сравнения путей баз.
+
+    Приводит путь к виду, в котором два написания одной базы совпадают: окончательный
+    каталог (os.path.realpath: junction и символическая ссылка), прямые слеши, нижний
+    регистр, без завершающего разделителя. Относительный путь достраивается от base_dir.
+    Подключенный диск и UNC-путь к тому же каталогу не сводятся.
+    """
+    if not value:
+        return ""
+    text = str(value).strip()
+    if not text:
+        return ""
+    if not os.path.isabs(text) and base_dir:
+        text = os.path.join(base_dir, text)
+    try:
+        text = os.path.realpath(text)
+    except (OSError, ValueError):
+        text = os.path.abspath(text)
+    text = text.replace("\\", "/").rstrip("/")
+    if not text:
+        text = "/"
+    return text.lower()
+
+
+def info_base_role(info_base_path, info_base_server, info_base_ref):
+    """Роль целевой базы по настройкам проекта.
+
+    Находит ближайший .v8-project.json и в нем запись того же вида, что и цель. Сервер и имя
+    вместе - цель серверная, путь в этом запуске не сравнивается. Сервер сравнивается без
+    порта 1541. Файловый путь - по окончательному каталогу. Поле type записи учитывается,
+    когда оно задано. Сравнение без учета регистра. Читает только имя и роль, остальные
+    поля файла не печатает.
+    """
+    # Импорт внутри функции: блок переносится в скилы с разным набором импортов, и обращение
+    # к неимпортированному имени попадало бы в except ниже - отказ стал бы тихим.
+    import json as _pg_json
+    state = {"name": "", "role": "", "config_path": ""}
+    start_dir = os.getcwd()
+    config_path = find_v8_project_file(start_dir)
+    if not config_path:
+        return state
+    state["config_path"] = config_path
+    try:
+        with open(config_path, "r", encoding="utf-8-sig") as handle:
+            project = _pg_json.load(handle)
+    except Exception as exc:
+        # Файл есть, но не разбирается: роль неизвестна. Молчать нельзя - иначе защита не
+        # работает, а причина не видна.
+        print(f"[warning] project settings not parsed: {config_path} ({exc})", file=sys.stderr)
+        state["config_path"] = ""
+        return state
+    databases = project.get("databases") if isinstance(project, dict) else None
+    if not isinstance(databases, list):
+        return state
+
+    config_dir = os.path.dirname(config_path)
+    server_key = info_base_server_key(info_base_server)
+    ref = (info_base_ref or "").strip().lower()
+    target = info_base_path_key(info_base_path, start_dir)
+    # Заданы сервер и имя - цель серверная, даже если рядом передан путь. Как у платформы.
+    server_target = bool(server_key and ref)
+
+    for db in databases:
+        if not isinstance(db, dict):
+            continue
+        kind = info_base_record_kind(db)
+        if server_target:
+            matched = (
+                kind == "server"
+                and info_base_server_key(db.get("server")) == server_key
+                and str(db.get("ref") or "").strip().lower() == ref
+            )
+        elif target and kind == "file":
+            matched = info_base_path_key(db.get("path"), config_dir) == target
+        else:
+            matched = False
+        if not matched:
+            continue
+        state["name"] = str(db.get("name") or db.get("id") or "")
+        state["role"] = str(db.get("role") or "").strip().lower()
+        if state["role"] == "prod":
+            return state
+    return state
+
+
+def assert_info_base_mutable(info_base_path, info_base_server, info_base_ref, allow_prod):
+    """Отказ изменяющей операции на базе, помеченной боевой.
+
+    Ничего не делает, когда передан allow_prod, когда записи базы нет и когда роль не prod.
+    При отказе печатает причину в stderr и завершает процесс кодом 1.
+    """
+    if allow_prod:
+        return
+    state = info_base_role(info_base_path, info_base_server, info_base_ref)
+    if state["role"] != "prod":
+        return
+    name = state["name"] or "<без имени>"
+    print(f"База '{name}' помечена как боевая (role: prod) в {state['config_path']}.\n"
+          "Изменяющая операция отменена. Запуск с --allow-prod - только по явной команде пользователя.",
+          file=sys.stderr)
+    sys.exit(1)
+# --- Конец общего блока защиты боевой базы ---
+
+def resolve_v8path(v8path):
+    """Resolve path to 1cv8.exe."""
+    if not v8path:
+        found = sorted(glob.glob(r"C:\Program Files\1cv8\*\bin\1cv8.exe"))
+        if found:
+            return found[-1]
+        else:
+            print("Error: 1cv8.exe not found. Specify -V8Path", file=sys.stderr)
+            sys.exit(1)
+    elif os.path.isdir(v8path):
+        v8path = os.path.join(v8path, "1cv8.exe")
+
+    if not os.path.isfile(v8path):
+        print(f"Error: 1cv8.exe not found at {v8path}", file=sys.stderr)
+        sys.exit(1)
+    return v8path
+
+
+# --- Вывод платформы (общий блок, версия 1) ---
+# Платформа пишет диагностику в кодировке консоли (866 на русской Windows), утилита
+# администрирования и часть сборок - в UTF-8. Байты читаются один раз и декодируются по
+# факту: перепутанная кодировка превращает сообщение об ошибке в нечитаемое.
+def read_platform_text(path):
+    if not path or not os.path.isfile(path):
+        return ""
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except OSError:
+        return ""
+    if not data:
+        return ""
+    if data.startswith(b"\xef\xbb\xbf"):
+        return data[3:].decode("utf-8", "replace")
+    try:
+        # Строгое декодирование бросает исключение на байтах, недопустимых в UTF-8, - это и
+        # есть признак однобайтовой кодировки. Нестрогое подставило бы символ замены молча.
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        return data.decode("cp866", "replace")
+
+
+def show_platform_output(paths):
+    """Вывод показывается и при успешном завершении: платформа сообщает предупреждения, не
+    меняя код возврата, и потерянное предупреждение обходится дороже лишних строк в протоколе.
+    """
+    chunks = []
+    for path in paths:
+        text = read_platform_text(path).strip()
+        if text:
+            chunks.append(text)
+    if not chunks:
+        return
+    print("--- Вывод платформы ---")
+    for chunk in chunks:
+        print(chunk)
+# --- Конец общего блока вывода платформы ---
+
+
+# --- Запуск платформы (общий блок, версия 1) ---
+# Платформа 8.5 оставляет после выхода процесс crashpad_handler, который наследует дескрипторы
+# запустившего. Чтение каналов до конца (capture_output) ждет его завершения. Здесь потоки
+# платформы пишутся в файлы, а ожидание идет до выхода самого процесса платформы.
+def run_platform_process(command, stdout_path, stderr_path):
+    """Запускает программу платформы и ждет выхода ее процесса, не потомков.
+
+    Не читает каналы: потоки вывода пишутся в файлы, показ вывода - show_platform_output.
+    На Windows subprocess передает процессу только три стандартных дескриптора
+    (close_fds по умолчанию), поэтому канал вывода скрипта потомку платформы не достается.
+
+    Параметры:
+        command - список аргументов или готовая командная строка Windows
+        stdout_path - файл для стандартного вывода (перезаписывается)
+        stderr_path - файл для потока ошибок (перезаписывается)
+
+    Возвращает: код возврата процесса.
+    """
+    with open(stdout_path, "wb") as so, open(stderr_path, "wb") as se:
+        proc = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=so, stderr=se)
+        return proc.wait()
+# --- Конец общего блока запуска платформы ---
+
+
+def main():
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+    parser = argparse.ArgumentParser(
+        description="Update 1C database configuration",
+        allow_abbrev=False,
+    )
+    parser.add_argument("-V8Path", default="")
+    parser.add_argument("-InfoBasePath", default="")
+    parser.add_argument("-InfoBaseServer", default="")
+    parser.add_argument("-InfoBaseRef", default="")
+    parser.add_argument("-AllowProd", "--allow-prod", dest="AllowProd", action="store_true",
+                        help="Allow a modifying operation against an infobase marked role: prod")
+    parser.add_argument("-UserName", default="")
+    parser.add_argument("-Password", default="")
+    parser.add_argument("-Extension", default="")
+    parser.add_argument("-AllExtensions", action="store_true")
+    parser.add_argument("-Dynamic", default="", choices=["", "+", "-"])
+    parser.add_argument("-Server", action="store_true")
+    parser.add_argument("-WarningsAsErrors", action="store_true")
+    parser.add_argument("-StrictLog", action="store_true")
+    parser.add_argument("-CheckApplicability", action="store_true")
+    args = parser.parse_args()
+
+    # --- Боевая база ---
+    assert_info_base_mutable(args.InfoBasePath, args.InfoBaseServer, args.InfoBaseRef, args.AllowProd)
+
+    v8path = resolve_v8path(args.V8Path)
+
+    # --- Validate connection ---
+    if not args.InfoBasePath and (not args.InfoBaseServer or not args.InfoBaseRef):
+        print("Error: specify -InfoBasePath or -InfoBaseServer + -InfoBaseRef", file=sys.stderr)
+        sys.exit(1)
+
+    # --- Temp dir ---
+    temp_dir = os.path.join(tempfile.gettempdir(), f"db_update_{random.randint(0, 999999)}")
+    os.makedirs(temp_dir, exist_ok=True)
+
+    try:
+        # --- Проверка применимости расширения ---
+        # Перехватчик расширения, который ссылается на метод, переименованный поставщиком,
+        # не виден ни синтаксическому контролю, ни проверке XML: исходники корректны. Отказ
+        # обнаруживается только этой проверкой и только против конкретной базы.
+        if args.CheckApplicability and not (args.Extension or args.AllExtensions):
+            print("Error: -CheckApplicability requires -Extension or -AllExtensions", file=sys.stderr)
+            sys.exit(1)
+
+        if args.CheckApplicability:
+            check_args = ["DESIGNER"]
+            if args.InfoBaseServer and args.InfoBaseRef:
+                check_args.extend(["/S", f"{args.InfoBaseServer}/{args.InfoBaseRef}"])
+            else:
+                check_args.extend(["/F", args.InfoBasePath])
+            if args.UserName:
+                check_args.append(f"/N{args.UserName}")
+            if args.Password:
+                check_args.append(f"/P{args.Password}")
+            check_args.append("/CheckCanApplyConfigurationExtensions")
+            if args.Extension:
+                check_args.extend(["-Extension", args.Extension])
+            check_out = os.path.join(temp_dir, "check_apply_log.txt")
+            check_result_file = os.path.join(temp_dir, "check_apply_result.txt")
+            check_args.extend(["/Out", check_out])
+            check_args.extend(["/DumpResult", check_result_file])
+            check_args.append("/DisableStartupDialogs")
+
+            print(f"Running: 1cv8.exe {hide_platform_secret(' '.join(check_args))}")
+            check_stdout = os.path.join(temp_dir, "check_stdout.txt")
+            check_stderr = os.path.join(temp_dir, "check_stderr.txt")
+            check_code = run_platform_process([v8path] + check_args, check_stdout, check_stderr)
+            show_platform_output([check_stdout, check_stderr])
+            check_log = None
+            if os.path.isfile(check_out):
+                try:
+                    with open(check_out, "r", encoding="utf-8-sig") as f:
+                        check_log = f.read()
+                except Exception:
+                    check_log = None
+            # Строгий режим здесь включен всегда, а не по ключу вызова: смысл проверки в том,
+            # чтобы остановить обновление. Отказ платформа сообщает строкой журнала при нулевом
+            # коде возврата, и без строгости проверка нашла бы несовместимость и пропустила
+            # обновление дальше.
+            check_code = write_platform_verdict(
+                check_code,
+                check_result_file,
+                check_log,
+                "Extension applicability check passed",
+                "Extension applicability check failed",
+                strict=True,
+            )
+            if check_code != 0:
+                print("Database configuration was NOT updated: the extension cannot be applied "
+                      "to this infobase", file=sys.stderr)
+                sys.exit(check_code)
+
+        # --- Build arguments ---
+        arguments = ["DESIGNER"]
+
+        if args.InfoBaseServer and args.InfoBaseRef:
+            arguments.extend(["/S", f"{args.InfoBaseServer}/{args.InfoBaseRef}"])
+        else:
+            arguments.extend(["/F", args.InfoBasePath])
+
+        if args.UserName:
+            arguments.append(f"/N{args.UserName}")
+        if args.Password:
+            arguments.append(f"/P{args.Password}")
+
+        arguments.append("/UpdateDBCfg")
+
+        # --- Options ---
+        if args.Dynamic:
+            arguments.append(f"-Dynamic{args.Dynamic}")
+        if args.Server:
+            arguments.append("-Server")
+        if args.WarningsAsErrors:
+            arguments.append("-WarningsAsErrors")
+
+        # --- Extensions ---
+        if args.Extension:
+            arguments.extend(["-Extension", args.Extension])
+        elif args.AllExtensions:
+            arguments.append("-AllExtensions")
+
+        # --- Output ---
+        # Каталог временный и уникальный на запуск, поэтому лог и файл результата не могут
+        # достаться от прошлого прогона.
+        out_file = os.path.join(temp_dir, "update_log.txt")
+        result_file = os.path.join(temp_dir, "update_result.txt")
+        arguments.extend(["/Out", out_file])
+        arguments.extend(["/DumpResult", result_file])
+        arguments.append("/DisableStartupDialogs")
+
+        # --- Execute ---
+        print(f"Running: 1cv8.exe {hide_platform_secret(' '.join(arguments))}")
+        platform_stdout = os.path.join(temp_dir, "platform_stdout.txt")
+        platform_stderr = os.path.join(temp_dir, "platform_stderr.txt")
+        exit_code = run_platform_process([v8path] + arguments, platform_stdout, platform_stderr)
+        show_platform_output([platform_stdout, platform_stderr])
+
+        # --- Result ---
+        log_content = None
+        if os.path.isfile(out_file):
+            try:
+                with open(out_file, "r", encoding="utf-8-sig") as f:
+                    log_content = f.read()
+            except Exception:
+                log_content = None
+
+        exit_code = write_platform_verdict(
+            exit_code,
+            result_file,
+            log_content,
+            "Database configuration updated successfully",
+            "Error updating database configuration",
+            strict=args.StrictLog,
+        )
+
+        sys.exit(exit_code)
+
+    finally:
+        if os.path.isdir(temp_dir):
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    main()
