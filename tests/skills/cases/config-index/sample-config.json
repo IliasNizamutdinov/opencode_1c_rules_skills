@@ -1,0 +1,20 @@
+{
+  "name": "Индекс конфигурации: объекты, типы, реквизиты, экспортные методы",
+  "setup": "fixture:sample-config",
+  "params": {
+    "outFile": "index.json"
+  },
+  "args_extra": [
+    "-ConfigPath",
+    "{workDir}"
+  ],
+  "expect": {
+    "files": [
+      "index.json"
+    ],
+    "stdoutContains": [
+      "Индекс собран: объектов 10",
+      "Общих модулей: 1"
+    ]
+  }
+}

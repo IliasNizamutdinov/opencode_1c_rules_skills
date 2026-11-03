@@ -1,0 +1,480 @@
+[
+  {
+    "id": "1c-bsl-runtime-specifics",
+    "category": "bsl",
+    "description": "Ошибки выполнения BSL, которые не видит статический анализ; ЗУП 3.x",
+    "paths": [
+      "**/*.bsl",
+      "**/*.os"
+    ],
+    "file": "bsl/1c-bsl-runtime-specifics.md"
+  },
+  {
+    "id": "1c-coding-standards",
+    "category": "bsl",
+    "description": "Стандарты кода BSL: именование, запросы, коллекции",
+    "paths": [
+      "**/*.bsl",
+      "**/*.os"
+    ],
+    "file": "bsl/1c-coding-standards.md"
+  },
+  {
+    "id": "1c-transactions-and-locks",
+    "category": "bsl",
+    "description": "Транзакции и управляемые блокировки: шаблон, порядок захвата",
+    "paths": [
+      "**/*.bsl",
+      "**/*.os"
+    ],
+    "file": "bsl/1c-transactions-and-locks.md"
+  },
+  {
+    "id": "1c77-specifics",
+    "category": "bsl",
+    "description": "Особенности 1С 7.7: коллекции, правка модулей скриптом, обмен и миграция",
+    "paths": [
+      "**/*.1s",
+      "**/*.ert",
+      "**/*.frm",
+      "**/1Cv7.MD"
+    ],
+    "file": "bsl/1c77-specifics.md"
+  },
+  {
+    "id": "async-methods-1c",
+    "category": "bsl",
+    "description": "Асинхронные методы 1С: Асинх/Ждать/Обещание (8.3.18+)",
+    "paths": [
+      "**/*.bsl",
+      "**/*.os"
+    ],
+    "file": "bsl/async-methods-1c.md"
+  },
+  {
+    "id": "refactoring",
+    "category": "bsl",
+    "description": "Правила рефакторинга кода 1С",
+    "paths": [
+      "**/*.bsl",
+      "**/*.os"
+    ],
+    "file": "bsl/refactoring.md"
+  },
+  {
+    "id": "text-formatting",
+    "category": "bsl",
+    "description": "Запрещенные символы в генерируемом тексте: длинное тире, буква ё, кавычки-елочки",
+    "paths": [],
+    "file": "bsl/text-formatting.md"
+  },
+  {
+    "id": "bsl-ssl",
+    "category": "bsp",
+    "description": "Переиспользование БСП, разметка правок типовых модулей, устаревшие объекты",
+    "paths": [
+      "**/*.bsl",
+      "**/*.os"
+    ],
+    "file": "bsp/bsl-ssl.md"
+  },
+  {
+    "id": "bsp-profile-rights-api",
+    "category": "bsp",
+    "description": "Программная работа с профилями групп доступа БСП: ссылки на ИдентификаторыОбъектовМетаданных",
+    "paths": [
+      "**/*.bsl",
+      "**/*.os"
+    ],
+    "file": "bsp/bsp-profile-rights-api.md"
+  },
+  {
+    "id": "routine_assignment_ext_processor",
+    "category": "bsp",
+    "description": "Фоновые задания из внешней обработки через БСП",
+    "paths": [
+      "**/*.bsl",
+      "**/*.os"
+    ],
+    "file": "bsp/routine_assignment_ext_processor.md"
+  },
+  {
+    "id": "1c-exchange-specifics",
+    "category": "exchange",
+    "description": "Особенности обменов: EnterpriseData, НСИ по HTTP, CPMDataExchange",
+    "paths": [
+      "**/XDTOPackages/**",
+      "**/*.xdto",
+      "**/ExchangePlans/**",
+      "**/HTTPServices/**",
+      "**/WebServices/**"
+    ],
+    "file": "exchange/1c-exchange-specifics.md"
+  },
+  {
+    "id": "1c-extension-patterns",
+    "category": "extensions",
+    "description": "Паттерны расширений CFE: перехватчики, маркеры",
+    "paths": [
+      "**/*.bsl",
+      "**/*.os"
+    ],
+    "file": "extensions/1c-extension-patterns.md"
+  },
+  {
+    "id": "1c-extension-specifics",
+    "category": "extensions",
+    "description": "Особенности расширений: перехваты, заимствование, XML-выгрузка внешних обработок",
+    "paths": [
+      "**/*.bsl",
+      "**/*.mdo",
+      "**/*.xml"
+    ],
+    "file": "extensions/1c-extension-specifics.md"
+  },
+  {
+    "id": "1c-form-reserved-names",
+    "category": "forms",
+    "description": "Зарезервированные имена свойств в модулях форм 1С",
+    "paths": [
+      "**/*.bsl"
+    ],
+    "file": "forms/1c-form-reserved-names.md"
+  },
+  {
+    "id": "1c-managed-forms-specifics",
+    "category": "forms",
+    "description": "Особенности управляемых форм: доработка в расширении, динамический список, элементы",
+    "paths": [
+      "**/*.form",
+      "**/Forms/**"
+    ],
+    "file": "forms/1c-managed-forms-specifics.md"
+  },
+  {
+    "id": "1c-ordinary-forms",
+    "category": "forms",
+    "description": "Обычные формы: отличия от управляемых, порядок операций с видимостью",
+    "paths": [
+      "**/Forms/**/*.bsl",
+      "**/Ext/Form.xml"
+    ],
+    "file": "forms/1c-ordinary-forms.md"
+  },
+  {
+    "id": "edt-form-xml-requirements",
+    "category": "forms",
+    "description": "Требования EDT к XML-формам (Form.form): extInfo, дефолты полей",
+    "paths": [
+      "**/Form.form",
+      "**/Forms/**"
+    ],
+    "file": "forms/edt-form-xml-requirements.md"
+  },
+  {
+    "id": "form_module_rules",
+    "category": "forms",
+    "description": "Клиент-серверное разделение в модулях форм",
+    "paths": [
+      "**/*.bsl"
+    ],
+    "file": "forms/form_module_rules.md"
+  },
+  {
+    "id": "forms_events",
+    "category": "forms",
+    "description": "Привязка обработчиков событий в Form.xml",
+    "paths": [
+      "**/Form.xml",
+      "**/*.bsl"
+    ],
+    "file": "forms/forms_events.md"
+  },
+  {
+    "id": "forms_generation",
+    "category": "forms",
+    "description": "Генерация и модификация форм 1С через 1c-forms-mcp",
+    "paths": [
+      "**/Forms/**/*.xml",
+      "**/Forms/**"
+    ],
+    "file": "forms/forms_generation.md"
+  },
+  {
+    "id": "1c-mdo-integrity",
+    "category": "metadata",
+    "description": "Целостность MDO-файлов: UUID, ссылки",
+    "paths": [
+      "**/*.mdo"
+    ],
+    "file": "metadata/1c-mdo-integrity.md"
+  },
+  {
+    "id": "edt-bsl-write-safety",
+    "category": "metadata",
+    "description": "Безопасная запись BSL-модулей через EDT MCP (режимы write_module_source)",
+    "paths": [
+      "**/*.bsl"
+    ],
+    "file": "metadata/edt-bsl-write-safety.md"
+  },
+  {
+    "id": "edt-known-errors",
+    "category": "metadata",
+    "description": "Известные ошибки EDT: запись метаданных, деплой, реструктуризация, хранилище",
+    "paths": [
+      "**/*.mdo",
+      "**/*.form",
+      "**/*.dcs",
+      "**/*.schedule",
+      "**/DT-INF/**"
+    ],
+    "file": "metadata/edt-known-errors.md"
+  },
+  {
+    "id": "edt-source-format",
+    "category": "metadata",
+    "description": "Формат исходников 1С и один владелец развертывания на прогон",
+    "paths": [
+      "**/*.mdo",
+      "**/*.form",
+      "**/Configuration.xml"
+    ],
+    "file": "metadata/edt-source-format.md"
+  },
+  {
+    "id": "edt-thick-client-monopoly",
+    "category": "metadata",
+    "description": "Монопольная сессия EDT и пакетный Конфигуратор, сборка .cf/.cfe из ИБ",
+    "paths": [
+      "**/*.mdo",
+      "**/DT-INF/**",
+      "**/*.cf",
+      "**/*.cfe",
+      "**/*.epf",
+      "**/*.erf",
+      "**/*.cmd",
+      "**/*.bat",
+      "**/*.ps1"
+    ],
+    "file": "metadata/edt-thick-client-monopoly.md"
+  },
+  {
+    "id": "edt-zip-export-pitfalls",
+    "category": "metadata",
+    "description": "Ограничения инкрементального экспорта конфигурации из EDT в ИБ",
+    "paths": [
+      "**/*.mdo"
+    ],
+    "file": "metadata/edt-zip-export-pitfalls.md"
+  },
+  {
+    "id": "external-data-source-mdo",
+    "category": "metadata",
+    "description": "Внешние источники данных (ВИД) в формате EDT",
+    "paths": [
+      "**/*.mdo",
+      "**/ExternalDataSources/**"
+    ],
+    "file": "metadata/external-data-source-mdo.md"
+  },
+  {
+    "id": "v8unpack-source-structure",
+    "category": "metadata",
+    "description": "Структура исходников v8unpack",
+    "paths": [
+      "**/*.obj.bsl",
+      "**/*.mgr.bsl",
+      "**/*.elem.json"
+    ],
+    "file": "metadata/v8unpack-source-structure.md"
+  },
+  {
+    "id": "anti_patterns",
+    "category": "performance",
+    "description": "Критические антипаттерны 1С: запрос в цикле, реквизиты через точку",
+    "paths": [
+      "**/*.bsl",
+      "**/*.os"
+    ],
+    "file": "performance/anti_patterns.md"
+  },
+  {
+    "id": "query-optimization-tips",
+    "category": "performance",
+    "description": "Оптимизация запросов 1С: ВЫРАЗИТЬ, ВТ, индексы",
+    "paths": [
+      "**/*.bsl",
+      "**/*.os"
+    ],
+    "file": "performance/query-optimization-tips.md"
+  },
+  {
+    "id": "1c-query-specifics",
+    "category": "queries",
+    "description": "Особенности запросов: совместимость типов, соединения, регистр бухгалтерии",
+    "paths": [
+      "**/*.bsl",
+      "**/*.os",
+      "**/*.dcs"
+    ],
+    "file": "queries/1c-query-specifics.md"
+  },
+  {
+    "id": "1c-report-direct-query",
+    "category": "queries",
+    "description": "Прямой запрос в отчётах 1С (СКД) без схемы компоновки",
+    "paths": [
+      "**/*.bsl",
+      "**/*.os"
+    ],
+    "file": "queries/1c-report-direct-query.md"
+  },
+  {
+    "id": "1c-role-rights",
+    "category": "security",
+    "description": "Права ролей 1С: права на объекты, RLS, наследование",
+    "paths": [
+      "**/Rights.xml",
+      "**/Roles/**",
+      "**/*.mdo"
+    ],
+    "file": "security/1c-role-rights.md"
+  },
+  {
+    "id": "git-safety-rules",
+    "category": "security",
+    "description": "Безопасная работа с git: деструктивные команды, секреты, политика EOL для 1С",
+    "paths": [],
+    "file": "security/git-safety-rules.md"
+  },
+  {
+    "id": "1c-skd-specifics",
+    "category": "skd",
+    "description": "Особенности СКД: отборы во временных таблицах, схема .dcs, оформление, вывод",
+    "paths": [
+      "**/*.dcs",
+      "**/Reports/**/*.bsl",
+      "**/ExternalReports/**"
+    ],
+    "file": "skd/1c-skd-specifics.md"
+  },
+  {
+    "id": "1c-skd-two-pass-preprocessing",
+    "category": "skd",
+    "description": "Двухпроходный СКД: предобработка детальных записей до свертки",
+    "paths": [
+      "**/Reports/**/*.bsl",
+      "**/*.dcs"
+    ],
+    "file": "skd/1c-skd-two-pass-preprocessing.md"
+  },
+  {
+    "id": "1c-cyrillic-windows",
+    "category": "workflow",
+    "description": "Кириллица в путях и аргументах на Windows: симптомы, кодировки, отказы",
+    "paths": [
+      "**/*.ps1",
+      "**/*.py",
+      "**/*.cmd",
+      "**/*.bat",
+      "**/*.mjs"
+    ],
+    "file": "workflow/1c-cyrillic-windows.md"
+  },
+  {
+    "id": "agent-verification-patterns",
+    "category": "workflow",
+    "description": "Паттерны проверки результата работы агента (reconciliation loop)",
+    "paths": [],
+    "file": "workflow/agent-verification-patterns.md"
+  },
+  {
+    "id": "agent-working-memory",
+    "category": "workflow",
+    "description": "Рабочая память агента: файлы плана, передача сессии, журнал инцидентов",
+    "paths": [],
+    "file": "workflow/agent-working-memory.md"
+  },
+  {
+    "id": "code-exploration-guide",
+    "category": "workflow",
+    "description": "Методология исследования кодовой базы 1С",
+    "paths": [],
+    "file": "workflow/code-exploration-guide.md"
+  },
+  {
+    "id": "code-review-checklist",
+    "category": "workflow",
+    "description": "Чеклист ревью BSL-кода",
+    "paths": [
+      "**/*.bsl",
+      "**/*.os"
+    ],
+    "file": "workflow/code-review-checklist.md"
+  },
+  {
+    "id": "designer-batch-verdict",
+    "category": "workflow",
+    "description": "Вердикт пакетного запуска платформы: четыре сигнала вместо кода возврата",
+    "paths": [
+      "**/scripts/*.ps1",
+      "**/scripts/*.py",
+      "**/*.cmd",
+      "**/*.bat"
+    ],
+    "file": "workflow/designer-batch-verdict.md"
+  },
+  {
+    "id": "file-edit-efficiency",
+    "category": "workflow",
+    "description": "Выбор инструмента чтения и правки файлов по стоимости токенов",
+    "paths": [],
+    "file": "workflow/file-edit-efficiency.md"
+  },
+  {
+    "id": "integrations",
+    "category": "workflow",
+    "description": "Python-first подход к HTTP-интеграциям 1С (прототип Python, перенос на BSL)",
+    "paths": [],
+    "file": "workflow/integrations.md"
+  },
+  {
+    "id": "mcp-tool-priority",
+    "category": "workflow",
+    "description": "Маршрутизатор MCP-серверов: какой сервер брать под задачу, обязательные проверки",
+    "paths": [],
+    "file": "workflow/mcp-tool-priority.md"
+  },
+  {
+    "id": "model-selection",
+    "category": "workflow",
+    "description": "Стратегия выбора моделей: Opus/Sonnet/Haiku по типу задачи",
+    "paths": [],
+    "file": "workflow/model-selection.md"
+  },
+  {
+    "id": "sdd-workflow",
+    "category": "workflow",
+    "description": "Specification-Driven Development: 9-фазный workflow разработки",
+    "paths": [],
+    "file": "workflow/sdd-workflow.md"
+  },
+  {
+    "id": "skill-design",
+    "category": "workflow",
+    "description": "Проектирование навыков: способы вызова, лестница информации, критерии завершения",
+    "paths": [],
+    "file": "workflow/skill-design.md"
+  },
+  {
+    "id": "testing-patterns",
+    "category": "workflow",
+    "description": "Паттерны тестирования 1С: YaXUnit, Vanessa",
+    "paths": [
+      "**/*.bsl",
+      "**/*.os"
+    ],
+    "file": "workflow/testing-patterns.md"
+  }
+]

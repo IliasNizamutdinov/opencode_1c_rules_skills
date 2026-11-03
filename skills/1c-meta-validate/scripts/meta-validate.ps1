@@ -1,0 +1,1787 @@
+﻿# meta-validate v1.3 - Validate 1C metadata object structure
+# Source: https://github.com/Desko77/claude-code-skills-1c
+param(
+	[Parameter(Mandatory)]
+	[string]$ObjectPath,
+
+	[switch]$Detailed,
+
+	[int]$MaxErrors = 30,
+
+	[string]$OutFile,
+
+	[string]$IndexPath
+)
+
+$ErrorActionPreference = "Stop"
+
+# --- Проверенный диапазон версий формата ---
+# Эталон - лестница версий в docs/1c-configuration-spec.md (§7.1). Границы не размножаются по
+# навыкам списками: их согласованность стережет tests/skills/check-format-versions.mjs.
+# Сравнение числовое, поэтому промежуточная версия ведет себя предсказуемо.
+$formatVerifiedMin = "2.17"
+$formatVerifiedMax = "2.21"
+
+function Get-FormatVersionRank {
+	param([string]$Version)
+	if ($Version -match '^(\d+)\.(\d+)$') { return [int]$Matches[1] * 100 + [int]$Matches[2] }
+	return 0
+}
+
+function Test-FormatVersionKnown {
+	param([string]$Version)
+	$rank = Get-FormatVersionRank $Version
+	if ($rank -eq 0) { return $false }
+	return ($rank -ge (Get-FormatVersionRank $formatVerifiedMin)) -and ($rank -le (Get-FormatVersionRank $formatVerifiedMax))
+}
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+
+# --- Batch mode: pipe-separated paths (comma reserved by PowerShell) ---
+
+$pathList = @($ObjectPath -split '\|' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+if ($pathList.Count -gt 1) {
+	$batchOk = 0
+	$batchFail = 0
+	foreach ($singlePath in $pathList) {
+		$callArgs = @{ ObjectPath = $singlePath; MaxErrors = $MaxErrors; Verbose = $Detailed }
+		if ($OutFile) {
+			$baseName = [System.IO.Path]::GetFileNameWithoutExtension($OutFile)
+			$ext = [System.IO.Path]::GetExtension($OutFile)
+			$dir = Split-Path $OutFile
+			if (-not $dir) { $dir = "." }
+			$objLeaf = [System.IO.Path]::GetFileNameWithoutExtension($singlePath)
+			$callArgs.OutFile = Join-Path $dir "$baseName`_$objLeaf$ext"
+		}
+		& $PSCommandPath @callArgs
+		if ($LASTEXITCODE -eq 0) { $batchOk++ } else { $batchFail++ }
+	}
+	Write-Host ""
+	Write-Host "=== Batch: $($pathList.Count) objects, $batchOk passed, $batchFail failed ==="
+	if ($batchFail -gt 0) { exit 1 }
+	exit 0
+}
+
+# --- Resolve path ---
+
+if (-not [System.IO.Path]::IsPathRooted($ObjectPath)) {
+	$ObjectPath = Join-Path (Get-Location).Path $ObjectPath
+}
+
+if (Test-Path $ObjectPath -PathType Container) {
+	$dirName = Split-Path $ObjectPath -Leaf
+	$candidate = Join-Path $ObjectPath "$dirName.xml"
+	$sibling = Join-Path (Split-Path $ObjectPath) "$dirName.xml"
+	if (Test-Path $candidate) {
+		$ObjectPath = $candidate
+	} elseif (Test-Path $sibling) {
+		$ObjectPath = $sibling
+	} else {
+		$xmlFiles = @(Get-ChildItem $ObjectPath -Filter "*.xml" -File | Select-Object -First 1)
+		if ($xmlFiles.Count -gt 0) {
+			$ObjectPath = $xmlFiles[0].FullName
+		} else {
+			Write-Host "[ERROR] No XML file found in directory: $ObjectPath"
+			exit 1
+		}
+	}
+}
+
+# File not found - check Dir/Name/Name.xml → Dir/Name.xml
+if (-not (Test-Path $ObjectPath)) {
+	$fileName = [System.IO.Path]::GetFileNameWithoutExtension($ObjectPath)
+	$parentDir = Split-Path $ObjectPath
+	$parentDirName = Split-Path $parentDir -Leaf
+	if ($fileName -eq $parentDirName) {
+		$candidate = Join-Path (Split-Path $parentDir) "$fileName.xml"
+		if (Test-Path $candidate) { $ObjectPath = $candidate }
+	}
+}
+if (-not (Test-Path $ObjectPath) -and (Test-Path "$ObjectPath.xml")) {
+	$ObjectPath = "$ObjectPath.xml"
+}
+
+if (-not (Test-Path $ObjectPath)) {
+	Write-Host "[ERROR] File not found: $ObjectPath"
+	exit 1
+}
+
+$resolvedPath = (Resolve-Path $ObjectPath).Path
+
+# --- Detect config directory (for cross-object checks) ---
+
+$script:configDir = $null
+$probe = Split-Path $resolvedPath
+for ($depth = 0; $depth -lt 4; $depth++) {
+	if (-not $probe) { break }
+	if (Test-Path (Join-Path $probe "Configuration.xml")) {
+		$script:configDir = $probe
+		break
+	}
+	$probe = Split-Path $probe
+}
+
+# --- Output infrastructure ---
+
+$script:errors = 0
+$script:warnings = 0
+$script:okCount = 0
+$script:stopped = $false
+$script:output = New-Object System.Text.StringBuilder 8192
+
+function Out-Line {
+	param([string]$msg)
+	$script:output.AppendLine($msg) | Out-Null
+}
+
+function Report-OK {
+	param([string]$msg)
+	$script:okCount++
+	if ($Detailed) { Out-Line "[OK]    $msg" }
+}
+
+function Report-Error {
+	param([string]$msg)
+	$script:errors++
+	Out-Line "[ERROR] $msg"
+	if ($script:errors -ge $MaxErrors) {
+		$script:stopped = $true
+	}
+}
+
+function Report-Warn {
+	param([string]$msg)
+	$script:warnings++
+	Out-Line "[WARN]  $msg"
+}
+
+$finalize = {
+	$checks = $script:okCount + $script:errors + $script:warnings
+	if ($script:errors -eq 0 -and $script:warnings -eq 0 -and -not $Detailed) {
+		$result = "=== Validation OK: $mdType.$objName ($checks checks) ==="
+	} else {
+		Out-Line ""
+		Out-Line "=== Result: $($script:errors) errors, $($script:warnings) warnings ($checks checks) ==="
+		$result = $script:output.ToString()
+	}
+	Write-Host $result
+
+	if ($OutFile) {
+		$utf8Bom = New-Object System.Text.UTF8Encoding $true
+		[System.IO.File]::WriteAllText($OutFile, $result, $utf8Bom)
+		Write-Host "Written to: $OutFile"
+	}
+}
+
+# --- Reference tables ---
+
+$guidPattern = '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+$identPattern = '^[A-Za-z\u0410-\u042F\u0401\u0430-\u044F\u0451_][A-Za-z0-9\u0410-\u042F\u0401\u0430-\u044F\u0451_]*$'
+
+$validTypes = @(
+	"Catalog","Document","Enum","Constant",
+	"InformationRegister","AccumulationRegister","AccountingRegister","CalculationRegister",
+	"ChartOfAccounts","ChartOfCharacteristicTypes","ChartOfCalculationTypes",
+	"BusinessProcess","Task","ExchangePlan","DocumentJournal",
+	"Report","DataProcessor",
+	"CommonModule","ScheduledJob","EventSubscription",
+	"HTTPService","WebService","DefinedType"
+)
+
+# Типы без собственного набора проверок: корень, uuid и имя - все, что можно проверить
+# по файлу, не зная правил объекта. Раньше навык звал такой тип нераспознанным.
+$structuralOnlyTypes = @(
+	"Language","Subsystem","StyleItem","Style",
+	"CommonPicture","SessionParameter","Role","CommonTemplate",
+	"FilterCriterion","CommonAttribute","XDTOPackage","WSReference",
+	"SettingsStorage","FunctionalOption","FunctionalOptionsParameter","CommonCommand",
+	"CommandGroup","CommonForm","DocumentNumerator","Sequence",
+	"IntegrationService","Bot"
+)
+
+# GeneratedType categories by type
+$generatedTypeCategories = @{
+	"Catalog"                    = @("Object","Ref","Selection","List","Manager")
+	"Document"                   = @("Object","Ref","Selection","List","Manager")
+	"Enum"                       = @("Ref","Manager","List")
+	"Constant"                   = @("Manager","ValueManager","ValueKey")
+	"InformationRegister"        = @("Record","Manager","Selection","List","RecordSet","RecordKey","RecordManager")
+	"AccumulationRegister"       = @("Record","Manager","Selection","List","RecordSet","RecordKey")
+	"AccountingRegister"         = @("Record","Manager","Selection","List","RecordSet","RecordKey","ExtDimensions")
+	"CalculationRegister"        = @("Record","Manager","Selection","List","RecordSet","RecordKey","Recalcs")
+	"ChartOfAccounts"            = @("Object","Ref","Selection","List","Manager","ExtDimensionTypes","ExtDimensionTypesRow")
+	"ChartOfCharacteristicTypes" = @("Object","Ref","Selection","List","Manager","Characteristic")
+	"ChartOfCalculationTypes"    = @("Object","Ref","Selection","List","Manager","DisplacingCalculationTypes","DisplacingCalculationTypesRow","BaseCalculationTypes","BaseCalculationTypesRow","LeadingCalculationTypes","LeadingCalculationTypesRow")
+	"BusinessProcess"            = @("Object","Ref","Selection","List","Manager","RoutePointRef")
+	"Task"                       = @("Object","Ref","Selection","List","Manager")
+	"ExchangePlan"               = @("Object","Ref","Selection","List","Manager")
+	"DocumentJournal"            = @("Selection","List","Manager")
+	"Report"                     = @("Object","Manager")
+	"DataProcessor"              = @("Object","Manager")
+	"DefinedType"                = @("DefinedType")
+}
+
+# Types that have NO InternalInfo / GeneratedType
+$typesWithoutInternalInfo = @("CommonModule","ScheduledJob","EventSubscription")
+
+# StandardAttributes by type
+$standardAttributesByType = @{
+	"Catalog"                    = @("PredefinedDataName","Predefined","Ref","DeletionMark","IsFolder","Owner","Parent","Description","Code")
+	"Document"                   = @("Posted","Ref","DeletionMark","Date","Number")
+	"Enum"                       = @("Order","Ref")
+	"InformationRegister"        = @("Active","LineNumber","Recorder","Period")
+	"AccumulationRegister"       = @("Active","LineNumber","Recorder","Period","RecordType")
+	"AccountingRegister"         = @("Active","Period","Recorder","LineNumber","Account")
+	"CalculationRegister"        = @("Active","Recorder","LineNumber","RegistrationPeriod","CalculationType","ReversingEntry","ActionPeriod","BegOfActionPeriod","EndOfActionPeriod","BegOfBasePeriod","EndOfBasePeriod")
+	"ChartOfAccounts"            = @("PredefinedDataName","Predefined","Ref","DeletionMark","Description","Code","Parent","Order","Type","OffBalance")
+	"ChartOfCharacteristicTypes" = @("PredefinedDataName","Predefined","Ref","DeletionMark","Description","Code","Parent","IsFolder","ValueType")
+	"ChartOfCalculationTypes"    = @("PredefinedDataName","Predefined","Ref","DeletionMark","Description","Code","ActionPeriodIsBasic")
+	"BusinessProcess"            = @("Ref","DeletionMark","Date","Number","Started","Completed","HeadTask")
+	"Task"                       = @("Ref","DeletionMark","Date","Number","Executed","Description","RoutePoint","BusinessProcess")
+	"ExchangePlan"               = @("Ref","DeletionMark","Code","Description","ThisNode","SentNo","ReceivedNo")
+	"DocumentJournal"            = @("Type","Ref","Date","Posted","DeletionMark","Number")
+}
+
+# Types that have StandardAttributes block
+$typesWithStdAttrs = @(
+	"Catalog","Document","Enum",
+	"InformationRegister","AccumulationRegister","AccountingRegister","CalculationRegister",
+	"ChartOfAccounts","ChartOfCharacteristicTypes","ChartOfCalculationTypes",
+	"BusinessProcess","Task","ExchangePlan","DocumentJournal"
+)
+
+# ChildObjects rules: what child element types are valid for each metadata type
+$childObjectRules = @{
+	"Catalog"                    = @("Attribute","TabularSection","Form","Template","Command")
+	"Document"                   = @("Attribute","TabularSection","Form","Template","Command")
+	"ExchangePlan"               = @("Attribute","TabularSection","Form","Template","Command")
+	"ChartOfAccounts"            = @("Attribute","TabularSection","Form","Template","Command","AccountingFlag","ExtDimensionAccountingFlag")
+	"ChartOfCharacteristicTypes" = @("Attribute","TabularSection","Form","Template","Command")
+	"ChartOfCalculationTypes"    = @("Attribute","TabularSection","Form","Template","Command")
+	"BusinessProcess"            = @("Attribute","TabularSection","Form","Template","Command")
+	"Task"                       = @("Attribute","TabularSection","Form","Template","Command","AddressingAttribute")
+	"Report"                     = @("Attribute","TabularSection","Form","Template","Command")
+	"DataProcessor"              = @("Attribute","TabularSection","Form","Template","Command")
+	"Enum"                       = @("EnumValue","Form","Template","Command")
+	"InformationRegister"        = @("Dimension","Resource","Attribute","Form","Template","Command")
+	"AccumulationRegister"       = @("Dimension","Resource","Attribute","Form","Template","Command")
+	"AccountingRegister"         = @("Dimension","Resource","Attribute","Form","Template","Command")
+	"CalculationRegister"        = @("Dimension","Resource","Attribute","Form","Template","Command","Recalculation")
+	"DocumentJournal"            = @("Column","Form","Template","Command")
+	"HTTPService"                = @("URLTemplate")
+	"WebService"                 = @("Operation")
+	"Constant"                   = @("Form")
+	"DefinedType"                = @()
+	"CommonModule"               = @()
+	"ScheduledJob"               = @()
+	"EventSubscription"          = @()
+}
+
+# Valid enum property values
+# Реестр многоязычных свойств: значение собирается из элементов v8:item/v8:lang/
+# v8:content. Источник - все элементы схемы http://v8.1c.ru/8.3/MDClasses.xsd с
+# моделью содержания v8:item. Непустой текст прямо в элементе платформа отвергает
+# при загрузке (ошибка XDTO), пустой элемент допустим.
+$mlTextProperties = @(
+	"BriefInformation", "ConfigurationInformationAddress", "Copyright",
+	"DetailedInformation", "EditFormat", "Explanation", "ExtendedListPresentation",
+	"ExtendedObjectPresentation", "ExtendedPresentation", "ExtendedRecordPresentation",
+	"Format", "ListPresentation", "ObjectPresentation", "RecordPresentation",
+	"Synonym", "ToolTip", "VendorInformationAddress"
+)
+
+$validPropertyValues = @{
+	"CodeType"                       = @("String","Number")
+	"CodeAllowedLength"              = @("Variable","Fixed")
+	"NumberType"                     = @("String","Number")
+	"NumberAllowedLength"            = @("Variable","Fixed")
+	"Posting"                        = @("Allow","Deny")
+	"RealTimePosting"                = @("Allow","Deny")
+	"RegisterRecordsDeletion"        = @("AutoDelete","AutoDeleteOnUnpost","AutoDeleteOff")
+	"RegisterRecordsWritingOnPost"   = @("WriteModified","WriteSelected")
+	"DataLockControlMode"            = @("Automatic","Managed")
+	"FullTextSearch"                 = @("Use","DontUse")
+	"DefaultPresentation"            = @("AsDescription","AsCode")
+	"HierarchyType"                  = @("HierarchyFoldersAndItems","HierarchyOfItems")
+	"EditType"                       = @("InDialog","InList","BothWays")
+	"WriteMode"                      = @("Independent","RecorderSubordinate")
+	"InformationRegisterPeriodicity" = @("Nonperiodical","Second","Day","Month","Quarter","Year","RecorderPosition")
+	"RegisterType"                   = @("Balance","Turnovers")
+	"ReturnValuesReuse"              = @("DontUse","DuringRequest","DuringSession")
+	"ReuseSessions"                  = @("DontUse","Use","AutoUse")
+	"FillChecking"                   = @("DontCheck","ShowError")
+	"Indexing"                       = @("DontIndex","Index","IndexWithAdditionalOrder")
+	"DataHistory"                    = @("Use","DontUse")
+	"DependenceOnCalculationTypes"   = @("DontUse","OnActionPeriod","OnRegistrationPeriod")
+}
+
+# Properties forbidden per type (would cause LoadConfigFromFiles error)
+$forbiddenProperties = @{
+	"ChartOfCharacteristicTypes" = @("CodeType")
+	"ChartOfAccounts"            = @("Autonumbering","Hierarchical")
+	"ChartOfCalculationTypes"    = @("CheckUnique","Autonumbering")
+	"ExchangePlan"               = @("CodeType","CheckUnique","Autonumbering")
+}
+
+# --- 1. Parse XML ---
+
+Out-Line ""
+
+$xmlDoc = $null
+try {
+	$xmlDoc = New-Object System.Xml.XmlDocument
+	$xmlDoc.PreserveWhitespace = $false
+	$xmlDoc.Load($resolvedPath)
+} catch {
+	Out-Line "=== Validation: (parse failed) ==="
+	Out-Line ""
+	Report-Error "1. XML parse failed: $($_.Exception.Message)"
+	& $finalize
+	exit 1
+}
+
+# --- 2. Register namespaces ---
+
+$ns = New-Object System.Xml.XmlNamespaceManager($xmlDoc.NameTable)
+$ns.AddNamespace("md", "http://v8.1c.ru/8.3/MDClasses")
+$ns.AddNamespace("v8", "http://v8.1c.ru/8.1/data/core")
+$ns.AddNamespace("xr", "http://v8.1c.ru/8.3/xcf/readable")
+$ns.AddNamespace("xsi", "http://www.w3.org/2001/XMLSchema-instance")
+$ns.AddNamespace("xs", "http://www.w3.org/2001/XMLSchema")
+$ns.AddNamespace("cfg", "http://v8.1c.ru/8.1/data/enterprise/current-config")
+
+$root = $xmlDoc.DocumentElement
+
+# --- Check 1: Root structure ---
+
+$check1Ok = $true
+
+# Root must be MetaDataObject
+if ($root.LocalName -ne "MetaDataObject") {
+	Report-Error "1. Root element is '$($root.LocalName)', expected 'MetaDataObject'"
+	& $finalize
+	exit 1
+}
+
+$expectedNs = "http://v8.1c.ru/8.3/MDClasses"
+if ($root.NamespaceURI -ne $expectedNs) {
+	Report-Error "1. Root namespace is '$($root.NamespaceURI)', expected '$expectedNs'"
+	$check1Ok = $false
+}
+
+# Version attribute
+$version = $root.GetAttribute("version")
+if (-not $version) {
+	Report-Warn "1. Missing version attribute on MetaDataObject"
+} elseif (-not (Test-FormatVersionKnown $version)) {
+	Report-Warn "1. Unusual version '$version' (expected $formatVerifiedMin-$formatVerifiedMax)"
+}
+
+# Detect type element - exactly one child element in md namespace
+$typeNode = $null
+$mdType = ""
+$childElements = @()
+foreach ($child in $root.ChildNodes) {
+	if ($child.NodeType -eq 'Element' -and $child.NamespaceURI -eq $expectedNs) {
+		$childElements += $child
+	}
+}
+
+if ($childElements.Count -eq 0) {
+	Report-Error "1. No metadata type element found inside MetaDataObject"
+	& $finalize
+	exit 1
+} elseif ($childElements.Count -gt 1) {
+	Report-Error "1. Multiple type elements found: $($childElements | ForEach-Object { $_.LocalName })"
+	$check1Ok = $false
+}
+
+$typeNode = $childElements[0]
+$mdType = $typeNode.LocalName
+
+if ($validTypes -notcontains $mdType -and $structuralOnlyTypes -notcontains $mdType) {
+	Report-Error "1. Unrecognized metadata type: $mdType"
+	& $finalize
+	exit 1
+}
+
+# UUID on type element
+$typeUuid = $typeNode.GetAttribute("uuid")
+if (-not $typeUuid) {
+	Report-Error "1. Missing uuid on <$mdType> element"
+	$check1Ok = $false
+} elseif ($typeUuid -notmatch $guidPattern) {
+	Report-Error "1. Invalid uuid '$typeUuid' on <$mdType>"
+	$check1Ok = $false
+}
+
+# Get object name early for header
+$propsNode = $typeNode.SelectSingleNode("md:Properties", $ns)
+$nameNode = if ($propsNode) { $propsNode.SelectSingleNode("md:Name", $ns) } else { $null }
+$objName = if ($nameNode -and $nameNode.InnerText) { $nameNode.InnerText } else { "(unknown)" }
+
+# Now emit header
+$script:output.Insert(0, "=== Validation: $mdType.$objName ===$([Environment]::NewLine)") | Out-Null
+
+if ($check1Ok) {
+	Report-OK "1. Root structure: MetaDataObject/$mdType, version $version"
+}
+
+if ($script:stopped) { & $finalize; exit 1 }
+
+if ($structuralOnlyTypes -contains $mdType) {
+	if ($objName -eq "(unknown)") {
+		Report-Error "1. Missing <Name> in Properties"
+	} else {
+		Report-OK "1. Имя объекта: $objName"
+	}
+	Report-OK "1. ${mdType}: базовая структурная проверка (корень, uuid, имя)"
+	& $finalize
+	if ($script:errors -gt 0) { exit 1 } else { exit 0 }
+}
+
+# --- Check 2: InternalInfo ---
+
+$internalInfo = $typeNode.SelectSingleNode("md:InternalInfo", $ns)
+
+if ($typesWithoutInternalInfo -contains $mdType) {
+	# These types should NOT have InternalInfo with GeneratedType
+	if ($internalInfo) {
+		$genTypes = $internalInfo.SelectNodes("xr:GeneratedType", $ns)
+		if ($genTypes.Count -gt 0) {
+			Report-Warn "2. InternalInfo: $mdType should not have GeneratedType entries, found $($genTypes.Count)"
+		} else {
+			Report-OK "2. InternalInfo: absent or empty (correct for $mdType)"
+		}
+	} else {
+		Report-OK "2. InternalInfo: absent (correct for $mdType)"
+	}
+} elseif ($generatedTypeCategories.ContainsKey($mdType)) {
+	$expectedCategories = $generatedTypeCategories[$mdType]
+	if (-not $internalInfo) {
+		Report-Error "2. InternalInfo: missing (expected $($expectedCategories.Count) GeneratedType)"
+	} else {
+		$genTypes = $internalInfo.SelectNodes("xr:GeneratedType", $ns)
+		$check2Ok = $true
+		$foundCategories = @()
+
+		foreach ($gt in $genTypes) {
+			$gtName = $gt.GetAttribute("name")
+			$gtCategory = $gt.GetAttribute("category")
+			$foundCategories += $gtCategory
+
+			# Validate name format: Prefix.ObjectName
+			if ($gtName -and $objName -ne "(unknown)") {
+				if (-not $gtName.EndsWith(".$objName")) {
+					Report-Error "2. GeneratedType name '$gtName' does not end with '.$objName'"
+					$check2Ok = $false
+				}
+			}
+
+			# Validate category
+			if ($expectedCategories -notcontains $gtCategory) {
+				Report-Warn "2. Unexpected GeneratedType category '$gtCategory' for $mdType"
+			}
+
+			# Validate TypeId and ValueId UUIDs
+			$typeId = $gt.SelectSingleNode("xr:TypeId", $ns)
+			$valueId = $gt.SelectSingleNode("xr:ValueId", $ns)
+			if ($typeId -and $typeId.InnerText -notmatch $guidPattern) {
+				Report-Error "2. Invalid TypeId UUID in GeneratedType '$gtCategory'"
+				$check2Ok = $false
+			}
+			if ($valueId -and $valueId.InnerText -notmatch $guidPattern) {
+				Report-Error "2. Invalid ValueId UUID in GeneratedType '$gtCategory'"
+				$check2Ok = $false
+			}
+		}
+
+		# ExchangePlan: check for ThisNode
+		if ($mdType -eq "ExchangePlan") {
+			$thisNode = $internalInfo.SelectSingleNode("xr:ThisNode", $ns)
+			if (-not $thisNode) {
+				Report-Warn "2. ExchangePlan missing xr:ThisNode in InternalInfo"
+			} elseif ($thisNode.InnerText -notmatch $guidPattern) {
+				Report-Error "2. ExchangePlan xr:ThisNode has invalid UUID"
+				$check2Ok = $false
+			}
+		}
+
+		# Check count mismatch
+		$missingCats = @($expectedCategories | Where-Object { $foundCategories -notcontains $_ })
+		if ($missingCats.Count -gt 0) {
+			Report-Warn "2. Missing GeneratedType categories: $($missingCats -join ', ')"
+		}
+
+		if ($check2Ok) {
+			$catList = ($foundCategories | Sort-Object) -join ", "
+			Report-OK "2. InternalInfo: $($genTypes.Count) GeneratedType ($catList)"
+		}
+	}
+}
+
+if ($script:stopped) { & $finalize; exit 1 }
+
+# --- Check 3: Properties - Name, Synonym ---
+
+if (-not $propsNode) {
+	Report-Error "3. Properties block missing"
+} else {
+	$check3Ok = $true
+
+	# Name
+	if (-not $nameNode -or -not $nameNode.InnerText) {
+		Report-Error "3. Properties: Name is missing or empty"
+		$check3Ok = $false
+	} else {
+		$nameVal = $nameNode.InnerText
+		if ($nameVal -notmatch $identPattern) {
+			Report-Error "3. Properties: Name '$nameVal' is not a valid 1C identifier"
+			$check3Ok = $false
+		}
+		if ($nameVal.Length -gt 80) {
+			Report-Warn "3. Properties: Name '$nameVal' is longer than 80 characters ($($nameVal.Length))"
+		}
+	}
+
+	# Synonym
+	$synNode = $propsNode.SelectSingleNode("md:Synonym", $ns)
+	$synPresent = $false
+	if ($synNode) {
+		$synItem = $synNode.SelectSingleNode("v8:item", $ns)
+		if ($synItem) {
+			$synContent = $synItem.SelectSingleNode("v8:content", $ns)
+			if ($synContent -and $synContent.InnerText) {
+				$synPresent = $true
+			}
+		}
+	}
+
+	if ($check3Ok) {
+		$synInfo = if ($synPresent) { "Synonym present" } else { "no Synonym" }
+		Report-OK "3. Properties: Name=`"$objName`", $synInfo"
+	}
+}
+
+if ($script:stopped) { & $finalize; exit 1 }
+
+# --- Check 4: Property values - enum properties ---
+
+if ($propsNode) {
+	$enumChecked = 0
+	$check4Ok = $true
+
+	foreach ($propName in $validPropertyValues.Keys) {
+		$propNode = $propsNode.SelectSingleNode("md:$propName", $ns)
+		if ($propNode -and $propNode.InnerText) {
+			$val = $propNode.InnerText
+			$allowed = $validPropertyValues[$propName]
+			if ($allowed -notcontains $val) {
+				Report-Error "4. Property '$propName' has invalid value '$val' (allowed: $($allowed -join ', '))"
+				$check4Ok = $false
+			}
+			$enumChecked++
+		}
+	}
+
+	if ($check4Ok) {
+		Report-OK "4. Property values: $enumChecked enum properties checked"
+	}
+} else {
+	Report-Warn "4. No Properties block to check"
+}
+
+if ($script:stopped) { & $finalize; exit 1 }
+
+# --- Check 4a: multilingual properties - v8:item structure ---
+
+<#
+.SYNOPSIS
+Формирует адрес блока Properties для сообщения; документ не изменяет.
+.PARAMETER block
+Проверяемый блок Properties.
+.OUTPUTS
+Строка: вид и имя владельца либо Properties.
+#>
+function Get-MLTextWhere($block) {
+	# Адрес блока Properties для сообщения: владелец блока и его имя.
+	$owner = $block.ParentNode
+	if (-not $owner -or $owner -eq $typeNode) { return "Properties" }
+	$tag = $owner.LocalName
+	$nameNode = $owner.SelectSingleNode("md:Properties/md:Name", $ns)
+	$name = if ($nameNode) { $nameNode.InnerText.Trim() } else { "" }
+	if ($name) { return "$tag '$name'" }
+	return $tag
+}
+
+$mlBlocks = @()
+if ($propsNode) { $mlBlocks += $propsNode }
+$mlBlocks += @($typeNode.SelectNodes("md:ChildObjects//md:Properties", $ns))
+
+$mlChecked = 0
+$check4aOk = $true
+foreach ($block in @($mlBlocks)) {
+	$where = Get-MLTextWhere $block
+	foreach ($propNode in @($block.ChildNodes)) {
+		if ($propNode.NodeType -ne 'Element') { continue }
+		if ($mlTextProperties -notcontains $propNode.LocalName) { continue }
+		$mlChecked++
+		$name = $propNode.LocalName
+		# Собственный текст узла, без текста дочерних элементов.
+		$ownText = ""
+		foreach ($tn in $propNode.ChildNodes) {
+			if ($tn.NodeType -in @('Text', 'CDATA')) { $ownText += $tn.Value }
+		}
+		if ($ownText.Trim()) {
+			Report-Error "4a. ${where}: $name is non-empty plain text without v8:item - platform rejects such value"
+			$check4aOk = $false
+		}
+		foreach ($child in @($propNode.ChildNodes)) {
+			if ($child.NodeType -ne 'Element') { continue }
+			if ($child.LocalName -ne "item" -or $child.NamespaceURI -ne $ns.LookupNamespace('v8')) {
+				Report-Error "4a. ${where}: $name contains element $($child.LocalName) instead of v8:item"
+				$check4aOk = $false
+				continue
+			}
+			# Пара обязана присутствовать целиком; текст языка платформа пишет и пустым.
+			$langNode = $child.SelectSingleNode("v8:lang", $ns)
+			$contentNode = $child.SelectSingleNode("v8:content", $ns)
+			if (-not $langNode -or -not $contentNode) {
+				Report-Error "4a. ${where}: $name/v8:item missing v8:lang/v8:content pair"
+				$check4aOk = $false
+			}
+		}
+	}
+}
+
+if ($check4aOk) {
+	Report-OK "4a. Multilingual properties: $mlChecked checked, v8:item structure valid"
+}
+
+if ($script:stopped) { & $finalize; exit 1 }
+
+# --- Check 5: StandardAttributes ---
+
+if ($typesWithStdAttrs -contains $mdType) {
+	$stdAttrNode = $propsNode.SelectSingleNode("md:StandardAttributes", $ns)
+	if (-not $stdAttrNode) {
+		# StandardAttributes block is optional for some types (e.g. Enum)
+		Report-OK "5. StandardAttributes: absent (optional for $mdType)"
+	} else {
+		$stdAttrs = $stdAttrNode.SelectNodes("xr:StandardAttribute", $ns)
+		$expectedStdAttrs = $standardAttributesByType[$mdType]
+		$check5Ok = $true
+
+		$foundNames = @()
+		foreach ($sa in $stdAttrs) {
+			$saName = $sa.GetAttribute("name")
+			if ($saName) {
+				$foundNames += $saName
+				if ($expectedStdAttrs -notcontains $saName) {
+					# AccountingRegister has dynamic ExtDimension{N}/ExtDimensionType{N} and optional PeriodAdjustment
+					$isDynamic = ($mdType -eq "AccountingRegister" -and ($saName -match '^ExtDimension\d+$' -or $saName -match '^ExtDimensionType\d+$' -or $saName -eq "PeriodAdjustment"))
+					# CalculationRegister has conditional period attrs
+					$isCalcDynamic = ($mdType -eq "CalculationRegister" -and $saName -in @("ActionPeriod","BegOfActionPeriod","EndOfActionPeriod","BegOfBasePeriod","EndOfBasePeriod"))
+					if (-not $isDynamic -and -not $isCalcDynamic) {
+						Report-Warn "5. Unexpected StandardAttribute '$saName' for $mdType"
+					}
+				}
+			} else {
+				Report-Error "5. StandardAttribute without 'name' attribute"
+				$check5Ok = $false
+			}
+		}
+
+		if ($expectedStdAttrs) {
+			$missingAttrs = @($expectedStdAttrs | Where-Object { $foundNames -notcontains $_ })
+			if ($missingAttrs.Count -gt 0) {
+				Report-Warn "5. Missing StandardAttributes: $($missingAttrs -join ', ')"
+			}
+		}
+
+		if ($check5Ok) {
+			Report-OK "5. StandardAttributes: $($stdAttrs.Count) entries"
+		}
+	}
+}
+
+if ($script:stopped) { & $finalize; exit 1 }
+
+# --- Check 6: ChildObjects - allowed element types ---
+
+$childObjNode = $typeNode.SelectSingleNode("md:ChildObjects", $ns)
+$allowedChildren = $childObjectRules[$mdType]
+
+if ($childObjNode) {
+	$check6Ok = $true
+	$childCounts = @{}
+
+	foreach ($child in $childObjNode.ChildNodes) {
+		if ($child.NodeType -ne 'Element') { continue }
+		$childTag = $child.LocalName
+
+		if ($allowedChildren -notcontains $childTag) {
+			Report-Error "6. ChildObjects: disallowed element '$childTag' for $mdType"
+			$check6Ok = $false
+		}
+
+		if (-not $childCounts.ContainsKey($childTag)) {
+			$childCounts[$childTag] = 0
+		}
+		$childCounts[$childTag]++
+	}
+
+	if ($check6Ok) {
+		$summary = ($childCounts.GetEnumerator() | Sort-Object Name | ForEach-Object { "$($_.Name)($($_.Value))" }) -join ", "
+		if ($summary) {
+			Report-OK "6. ChildObjects types: $summary"
+		} else {
+			Report-OK "6. ChildObjects: empty (valid for $mdType)"
+		}
+	}
+} elseif ($allowedChildren.Count -eq 0) {
+	Report-OK "6. ChildObjects: absent (correct for $mdType)"
+} else {
+	# Some types may have no children - that's OK
+	Report-OK "6. ChildObjects: absent"
+}
+
+# --- Check 6a-6d: Form registrations resolve to descriptors on disk ---
+# Регистрация <Form>Имя</Form> без файла Forms/Имя.xml проходит разбор XML,
+# а загрузка конфигурации в базу отказывает: "Файл не обнаружен".
+
+if ($childObjNode) {
+	$objectDir = Join-Path (Split-Path $resolvedPath) ([System.IO.Path]::GetFileNameWithoutExtension($resolvedPath))
+	$formRegs = @($childObjNode.ChildNodes | Where-Object { $_.NodeType -eq 'Element' -and $_.LocalName -eq 'Form' })
+	$formsOk = $true
+	foreach ($reg in $formRegs) {
+		$regName = $reg.InnerText.Trim()
+		$nested = @($reg.ChildNodes | Where-Object { $_.NodeType -eq 'Element' }).Count -gt 0
+		if ($nested -or -not $regName) {
+			Report-Error "6a. ChildObjects/Form: registration must be a form name, not a nested element"
+			$formsOk = $false
+			continue
+		}
+		$rel = "Forms/$regName.xml"
+		$descriptor = Join-Path (Join-Path $objectDir "Forms") "$regName.xml"
+		if (-not (Test-Path -LiteralPath $descriptor -PathType Leaf)) {
+			Report-Error "6b. ChildObjects/Form '$regName': descriptor not found: $rel"
+			$formsOk = $false
+			continue
+		}
+		$formDoc = New-Object System.Xml.XmlDocument
+		try {
+			$formDoc.Load($descriptor)
+		} catch {
+			Report-Error "6c. ChildObjects/Form '$regName': $rel is not well-formed XML: $($_.Exception.Message)"
+			$formsOk = $false
+			continue
+		}
+		$formNs = New-Object System.Xml.XmlNamespaceManager($formDoc.NameTable)
+		$formNs.AddNamespace("md", "http://v8.1c.ru/8.3/MDClasses")
+		$declaredNode = $formDoc.SelectSingleNode("/md:MetaDataObject/md:Form/md:Properties/md:Name", $formNs)
+		$declared = if ($declaredNode) { $declaredNode.InnerText.Trim() } else { "" }
+		if ($declared -cne $regName) {
+			Report-Error "6d. ChildObjects/Form '$regName': $rel declares Name '$declared'"
+			$formsOk = $false
+		}
+	}
+	if ($formRegs.Count -gt 0 -and $formsOk) {
+		Report-OK "6a-6d. Forms: $($formRegs.Count) registration(s) resolve to descriptors"
+	}
+}
+
+if ($script:stopped) { & $finalize; exit 1 }
+
+# --- Check 7: Attributes/Dimensions/Resources/EnumValues/Columns - UUID, Name, Type ---
+
+function Check-ChildElement {
+	param(
+		[System.Xml.XmlNode]$node,
+		[string]$kind,
+		[bool]$requireType
+	)
+
+	$uuid = $node.GetAttribute("uuid")
+	if (-not $uuid) {
+		Report-Error "7. $kind missing uuid"
+		return $false
+	} elseif ($uuid -notmatch $guidPattern) {
+		Report-Error "7. $kind has invalid uuid '$uuid'"
+		return $false
+	}
+
+	$elProps = $node.SelectSingleNode("md:Properties", $ns)
+	if (-not $elProps) {
+		Report-Error "7. $kind (uuid=$uuid) missing Properties"
+		return $false
+	}
+
+	$elName = $elProps.SelectSingleNode("md:Name", $ns)
+	if (-not $elName -or -not $elName.InnerText) {
+		Report-Error "7. $kind (uuid=$uuid) missing or empty Name"
+		return $false
+	}
+
+	$nameVal = $elName.InnerText
+	if ($nameVal -notmatch $identPattern) {
+		Report-Error "7. $kind '$nameVal' has invalid identifier"
+		return $false
+	}
+
+	if ($requireType) {
+		$typeEl = $elProps.SelectSingleNode("md:Type", $ns)
+		if (-not $typeEl) {
+			Report-Error "7. $kind '$nameVal' missing Type block"
+			return $false
+		}
+		$v8Types = $typeEl.SelectNodes("v8:Type", $ns)
+		$v8TypeSets = $typeEl.SelectNodes("v8:TypeSet", $ns)
+		if ($v8Types.Count -eq 0 -and $v8TypeSets.Count -eq 0) {
+			Report-Error "7. $kind '$nameVal' Type block has no v8:Type or v8:TypeSet"
+			return $false
+		}
+	}
+
+	return $true
+}
+
+if ($childObjNode) {
+	$check7Ok = $true
+	$check7Count = 0
+	$elementKinds = @("Attribute","Dimension","Resource","EnumValue","Column")
+
+	foreach ($kind in $elementKinds) {
+		$elements = $childObjNode.SelectNodes("md:$kind", $ns)
+		$requireType = ($kind -ne "EnumValue" -and $kind -ne "Column")
+		foreach ($el in $elements) {
+			if ($script:stopped) { break }
+			$ok = Check-ChildElement -node $el -kind $kind -requireType $requireType
+			if (-not $ok) { $check7Ok = $false }
+			$check7Count++
+		}
+	}
+
+	if ($check7Ok -and $check7Count -gt 0) {
+		Report-OK "7. Child elements: $check7Count items checked (UUID, Name, Type)"
+	} elseif ($check7Count -eq 0) {
+		Report-OK "7. Child elements: none to check"
+	}
+}
+
+if ($script:stopped) { & $finalize; exit 1 }
+
+# --- Check 7b: Reserved attribute names ---
+
+$reservedAttrNames = @(
+	"Ref","DeletionMark","Code","Description","Date","Number","Posted","Parent","Owner",
+	"IsFolder","Predefined","PredefinedDataName","Recorder","Period","LineNumber","Active",
+	"Order","Type","OffBalance","Started","Completed","HeadTask","Executed","RoutePoint",
+	"BusinessProcess","ThisNode","SentNo","ReceivedNo","CalculationType","RegistrationPeriod",
+	"ReversingEntry","Account","ValueType","ActionPeriodIsBasic",
+	# Русские формы тех же имен: выгрузка ведется на языке конфигурации, и реквизит с именем
+	# стандартного платформа отвергает независимо от того, каким языком оно записано.
+	"Ссылка","ПометкаУдаления","Код","Наименование","Дата","Номер","Проведен","Родитель",
+	"Владелец","ЭтоГруппа","Предопределенный","ИмяПредопределенныхДанных","Регистратор",
+	"Период","НомерСтроки","Активность","Порядок","Тип","Забалансовый","Стартован",
+	"Завершен","ВедущаяЗадача","Выполнена","ТочкаМаршрута","БизнесПроцесс","ЭтотУзел",
+	"НомерОтправленного","НомерПринятого","ВидРасчета","ПериодРегистрации","СторноЗапись",
+	"Счет","ТипЗначения","БазовыйПериодЯвляетсяОсновным"
+)
+
+if ($childObjNode) {
+	$check7bOk = $true
+	$attrNodes = $childObjNode.SelectNodes("md:Attribute", $ns)
+	foreach ($attrNode in $attrNodes) {
+		$attrProps = $attrNode.SelectSingleNode("md:Properties", $ns)
+		if ($attrProps) {
+			$attrNameNode = $attrProps.SelectSingleNode("md:Name", $ns)
+			if ($attrNameNode -and $attrNameNode.InnerText) {
+				$an = $attrNameNode.InnerText
+				# Написание с точками над е и без них - одно и то же имя для платформы.
+				$anNormalized = $an.Replace([char]0x451, [char]0x435).Replace([char]0x401, [char]0x415)
+				if ($reservedAttrNames -contains $anNormalized) {
+					Report-Error "7b. Реквизит '$an' повторяет имя стандартного реквизита"
+					$check7bOk = $false
+				}
+			}
+		}
+	}
+	if ($check7bOk) {
+		Report-OK "7b. Reserved attribute names: no conflicts"
+	}
+}
+
+if ($script:stopped) { & $finalize; exit 1 }
+
+# --- Check 8: Name uniqueness ---
+
+function Check-Uniqueness {
+	param(
+		[System.Xml.XmlNodeList]$nodes,
+		[string]$kind
+	)
+
+	$names = @{}
+	$hasDupes = $false
+
+	foreach ($node in $nodes) {
+		$elProps = $node.SelectSingleNode("md:Properties", $ns)
+		if (-not $elProps) { continue }
+		$elName = $elProps.SelectSingleNode("md:Name", $ns)
+		if (-not $elName -or -not $elName.InnerText) { continue }
+
+		$nameVal = $elName.InnerText
+		if ($names.ContainsKey($nameVal)) {
+			Report-Error "8. Duplicate $kind name: '$nameVal'"
+			$hasDupes = $true
+		} else {
+			$names[$nameVal] = $true
+		}
+	}
+
+	return (-not $hasDupes)
+}
+
+if ($childObjNode) {
+	$check8Ok = $true
+
+	# Attributes
+	$attrs = $childObjNode.SelectNodes("md:Attribute", $ns)
+	if ($attrs.Count -gt 0) {
+		if (-not (Check-Uniqueness -nodes $attrs -kind "Attribute")) { $check8Ok = $false }
+	}
+
+	# TabularSections
+	$tss = $childObjNode.SelectNodes("md:TabularSection", $ns)
+	if ($tss.Count -gt 0) {
+		if (-not (Check-Uniqueness -nodes $tss -kind "TabularSection")) { $check8Ok = $false }
+	}
+
+	# Dimensions
+	$dims = $childObjNode.SelectNodes("md:Dimension", $ns)
+	if ($dims.Count -gt 0) {
+		if (-not (Check-Uniqueness -nodes $dims -kind "Dimension")) { $check8Ok = $false }
+	}
+
+	# Resources
+	$ress = $childObjNode.SelectNodes("md:Resource", $ns)
+	if ($ress.Count -gt 0) {
+		if (-not (Check-Uniqueness -nodes $ress -kind "Resource")) { $check8Ok = $false }
+	}
+
+	# EnumValues
+	$evs = $childObjNode.SelectNodes("md:EnumValue", $ns)
+	if ($evs.Count -gt 0) {
+		if (-not (Check-Uniqueness -nodes $evs -kind "EnumValue")) { $check8Ok = $false }
+	}
+
+	# Columns (DocumentJournal)
+	$cols = $childObjNode.SelectNodes("md:Column", $ns)
+	if ($cols.Count -gt 0) {
+		if (-not (Check-Uniqueness -nodes $cols -kind "Column")) { $check8Ok = $false }
+	}
+
+	# URLTemplates (HTTPService)
+	$urlTs = $childObjNode.SelectNodes("md:URLTemplate", $ns)
+	if ($urlTs.Count -gt 0) {
+		if (-not (Check-Uniqueness -nodes $urlTs -kind "URLTemplate")) { $check8Ok = $false }
+	}
+
+	# Operations (WebService)
+	$ops = $childObjNode.SelectNodes("md:Operation", $ns)
+	if ($ops.Count -gt 0) {
+		if (-not (Check-Uniqueness -nodes $ops -kind "Operation")) { $check8Ok = $false }
+	}
+
+	if ($check8Ok) {
+		Report-OK "8. Name uniqueness: all names unique"
+	}
+}
+
+if ($script:stopped) { & $finalize; exit 1 }
+
+# --- Check 9: TabularSections - internal structure ---
+
+if ($childObjNode) {
+	$tsSections = $childObjNode.SelectNodes("md:TabularSection", $ns)
+	if ($tsSections.Count -gt 0) {
+		$check9Ok = $true
+		$tsCount = 0
+
+		foreach ($ts in $tsSections) {
+			if ($script:stopped) { break }
+			$tsCount++
+
+			# UUID
+			$tsUuid = $ts.GetAttribute("uuid")
+			if (-not $tsUuid -or $tsUuid -notmatch $guidPattern) {
+				Report-Error "9. TabularSection #${tsCount}: invalid or missing uuid"
+				$check9Ok = $false
+			}
+
+			# Name
+			$tsProps = $ts.SelectSingleNode("md:Properties", $ns)
+			$tsNameNode = if ($tsProps) { $tsProps.SelectSingleNode("md:Name", $ns) } else { $null }
+			$tsName = if ($tsNameNode) { $tsNameNode.InnerText } else { "(unnamed)" }
+
+			if (-not $tsNameNode -or -not $tsNameNode.InnerText) {
+				Report-Error "9. TabularSection #${tsCount}: missing or empty Name"
+				$check9Ok = $false
+			}
+
+			# InternalInfo with 2 GeneratedType (TabularSection + TabularSectionRow)
+			$tsIntInfo = $ts.SelectSingleNode("md:InternalInfo", $ns)
+			if ($tsIntInfo) {
+				$tsGens = $tsIntInfo.SelectNodes("xr:GeneratedType", $ns)
+				if ($tsGens.Count -lt 2) {
+					Report-Warn "9. TabularSection '$tsName': expected 2 GeneratedType, found $($tsGens.Count)"
+				}
+			}
+
+			# Attributes inside TS
+			$tsChildObj = $ts.SelectSingleNode("md:ChildObjects", $ns)
+			if ($tsChildObj) {
+				$tsAttrs = $tsChildObj.SelectNodes("md:Attribute", $ns)
+				$tsAttrNames = @{}
+				foreach ($ta in $tsAttrs) {
+					$taOk = Check-ChildElement -node $ta -kind "TabularSection '$tsName'.Attribute" -requireType $true
+					if (-not $taOk) { $check9Ok = $false }
+
+					# Check name uniqueness within TS
+					$taProps = $ta.SelectSingleNode("md:Properties", $ns)
+					$taName = if ($taProps) { $taProps.SelectSingleNode("md:Name", $ns) } else { $null }
+					if ($taName -and $taName.InnerText) {
+						if ($tsAttrNames.ContainsKey($taName.InnerText)) {
+							Report-Error "9. Duplicate attribute '$($taName.InnerText)' in TabularSection '$tsName'"
+							$check9Ok = $false
+						} else {
+							$tsAttrNames[$taName.InnerText] = $true
+						}
+					}
+				}
+
+				# StandardAttributes of TS: expect LineNumber
+				$tsStdAttr = $tsProps.SelectSingleNode("md:StandardAttributes", $ns)
+				if ($tsStdAttr) {
+					$tsStdAttrs = $tsStdAttr.SelectNodes("xr:StandardAttribute", $ns)
+					$hasLineNumber = $false
+					foreach ($tsa in $tsStdAttrs) {
+						if ($tsa.GetAttribute("name") -eq "LineNumber") { $hasLineNumber = $true }
+					}
+					if (-not $hasLineNumber) {
+						Report-Warn "9. TabularSection '$tsName': missing LineNumber StandardAttribute"
+					}
+				}
+			}
+		}
+
+		if ($check9Ok) {
+			Report-OK "9. TabularSections: $tsCount sections, structure valid"
+		}
+	} else {
+		Report-OK "9. TabularSections: none present"
+	}
+}
+
+if ($script:stopped) { & $finalize; exit 1 }
+
+# --- Check 10: Cross-property consistency ---
+
+$check10Ok = $true
+$check10Issues = 0
+
+if ($propsNode) {
+	# HierarchyType set but Hierarchical = false
+	$hierarchical = $propsNode.SelectSingleNode("md:Hierarchical", $ns)
+	$hierarchyType = $propsNode.SelectSingleNode("md:HierarchyType", $ns)
+	if ($hierarchical -and $hierarchyType -and $hierarchical.InnerText -eq "false" -and $hierarchyType.InnerText) {
+		Report-Warn "10. HierarchyType='$($hierarchyType.InnerText)' but Hierarchical=false"
+		$check10Issues++
+	}
+
+	# CommonModule: no context enabled
+	if ($mdType -eq "CommonModule") {
+		$contexts = @("Server","ClientManagedApplication","ClientOrdinaryApplication","ExternalConnection","ServerCall","Global")
+		$anyEnabled = $false
+		foreach ($ctx in $contexts) {
+			$ctxNode = $propsNode.SelectSingleNode("md:$ctx", $ns)
+			if ($ctxNode -and $ctxNode.InnerText -eq "true") {
+				$anyEnabled = $true
+				break
+			}
+		}
+		if (-not $anyEnabled) {
+			Report-Warn "10. CommonModule: no execution context enabled"
+			$check10Issues++
+		}
+	}
+
+	# EventSubscription: empty Handler
+	if ($mdType -eq "EventSubscription") {
+		$handler = $propsNode.SelectSingleNode("md:Handler", $ns)
+		if (-not $handler -or -not $handler.InnerText.Trim()) {
+			Report-Error "10. EventSubscription: empty Handler"
+			$check10Ok = $false
+			$check10Issues++
+		}
+
+		# Empty Source
+		$source = $propsNode.SelectSingleNode("md:Source", $ns)
+		$hasSource = $false
+		if ($source) {
+			$sourceTypes = $source.SelectNodes("v8:Type", $ns)
+			if ($sourceTypes.Count -gt 0) { $hasSource = $true }
+		}
+		if (-not $hasSource) {
+			Report-Warn "10. EventSubscription: no Source types specified"
+			$check10Issues++
+		}
+	}
+
+	# ScheduledJob: empty MethodName
+	if ($mdType -eq "ScheduledJob") {
+		$method = $propsNode.SelectSingleNode("md:MethodName", $ns)
+		if (-not $method -or -not $method.InnerText.Trim()) {
+			Report-Error "10. ScheduledJob: empty MethodName"
+			$check10Ok = $false
+			$check10Issues++
+		}
+	}
+
+	# AccountingRegister: ChartOfAccounts must not be empty
+	if ($mdType -eq "AccountingRegister") {
+		$coa = $propsNode.SelectSingleNode("md:ChartOfAccounts", $ns)
+		if (-not $coa -or -not $coa.InnerText.Trim()) {
+			Report-Error "10. AccountingRegister: empty ChartOfAccounts"
+			$check10Ok = $false
+			$check10Issues++
+			Write-Host "[HINT] /meta-edit -Operation modify-property -Value `"ChartOfAccounts=ChartOfAccounts.XXX`""
+		}
+	}
+
+	# CalculationRegister: ChartOfCalculationTypes must not be empty
+	if ($mdType -eq "CalculationRegister") {
+		$coct = $propsNode.SelectSingleNode("md:ChartOfCalculationTypes", $ns)
+		if (-not $coct -or -not $coct.InnerText.Trim()) {
+			Report-Error "10. CalculationRegister: empty ChartOfCalculationTypes"
+			$check10Ok = $false
+			$check10Issues++
+			Write-Host "[HINT] /meta-edit -Operation modify-property -Value `"ChartOfCalculationTypes=ChartOfCalculationTypes.XXX`""
+		}
+	}
+
+	# BusinessProcess: Task should not be empty
+	if ($mdType -eq "BusinessProcess") {
+		$taskProp = $propsNode.SelectSingleNode("md:Task", $ns)
+		if (-not $taskProp -or -not $taskProp.InnerText.Trim()) {
+			Report-Warn "10. BusinessProcess: empty Task reference"
+			$check10Issues++
+			Write-Host "[HINT] /meta-edit -Operation modify-property -Value `"Task=Task.XXX`""
+		}
+	}
+
+	# CalculationRegister: ActionPeriod=true requires non-empty Schedule
+	if ($mdType -eq "CalculationRegister") {
+		$actionPeriod = $propsNode.SelectSingleNode("md:ActionPeriod", $ns)
+		if ($actionPeriod -and $actionPeriod.InnerText -eq "true") {
+			$schedule = $propsNode.SelectSingleNode("md:Schedule", $ns)
+			if (-not $schedule -or -not $schedule.InnerText.Trim()) {
+				Report-Warn "10. CalculationRegister: ActionPeriod=true but Schedule is empty - platform requires a schedule register"
+				$check10Issues++
+			}
+		}
+	}
+
+	# DocumentJournal: RegisteredDocuments should not be empty
+	if ($mdType -eq "DocumentJournal") {
+		$regDocs = $propsNode.SelectSingleNode("md:RegisteredDocuments", $ns)
+		$hasRegDocs = $false
+		if ($regDocs) {
+			$items = $regDocs.SelectNodes("v8:Type", $ns)
+			if ($items.Count -gt 0) { $hasRegDocs = $true }
+		}
+		if (-not $hasRegDocs) {
+			Report-Warn "10. DocumentJournal: no RegisteredDocuments specified"
+			$check10Issues++
+		}
+	}
+
+	# ChartOfAccounts: ExtDimensionTypes should be set if MaxExtDimensionCount > 0
+	if ($mdType -eq "ChartOfAccounts") {
+		$maxExtDim = $propsNode.SelectSingleNode("md:MaxExtDimensionCount", $ns)
+		if ($maxExtDim -and [int]$maxExtDim.InnerText -gt 0) {
+			$edt = $propsNode.SelectSingleNode("md:ExtDimensionTypes", $ns)
+			if (-not $edt -or -not $edt.InnerText.Trim()) {
+				Report-Warn "10. ChartOfAccounts: MaxExtDimensionCount>0 but ExtDimensionTypes is empty"
+				$check10Issues++
+				Write-Host "[HINT] /meta-edit -Operation modify-property -Value `"ExtDimensionTypes=ChartOfCharacteristicTypes.XXX`""
+			}
+		}
+	}
+
+	# Register: must have at least one Dimension or Resource (platform rejects empty registers)
+	$regTypesAll = @("AccumulationRegister","AccountingRegister","CalculationRegister","InformationRegister")
+	if ($regTypesAll -contains $mdType -and $childObjNode) {
+		$dims = $childObjNode.SelectNodes("md:Dimension", $ns).Count
+		$ress = $childObjNode.SelectNodes("md:Resource", $ns).Count
+		$attrs = $childObjNode.SelectNodes("md:Attribute", $ns).Count
+		if (($dims + $ress + $attrs) -eq 0) {
+			Report-Warn "10. $mdType`: no Dimensions, Resources, or Attributes - platform will reject"
+			$check10Issues++
+		}
+	}
+
+	# Document: RegisterRecords references should point to existing objects in config
+	if ($mdType -eq "Document" -and $script:configDir) {
+		$regRecords = $propsNode.SelectSingleNode("md:RegisterRecords", $ns)
+		if ($regRecords) {
+			$items = $regRecords.SelectNodes("xr:Item", $ns)
+			foreach ($item in $items) {
+				$refVal = $item.InnerText.Trim()
+				if (-not $refVal) { continue }
+				# Parse "AccumulationRegister.Name" → dir AccumulationRegisters/Name
+				$parts = $refVal -split '\.',2
+				if ($parts.Count -eq 2) {
+					$refType = $parts[0]; $refName = $parts[1]
+					$dirMap = @{
+						"AccumulationRegister"="AccumulationRegisters"; "InformationRegister"="InformationRegisters"
+						"AccountingRegister"="AccountingRegisters"; "CalculationRegister"="CalculationRegisters"
+					}
+					$refDir = $dirMap[$refType]
+					if ($refDir) {
+						$refPath = Join-Path $script:configDir "$refDir/$refName"
+						$refXml = Join-Path $script:configDir "$refDir/$refName.xml"
+						if (-not (Test-Path $refPath) -and -not (Test-Path $refXml)) {
+							Report-Warn "10. Document.RegisterRecords references '$refVal' but object not found in config"
+							$check10Issues++
+						}
+					}
+				}
+			}
+		}
+	}
+
+	# Register: must have at least one registrar document
+	$registerTypes = @("AccumulationRegister","AccountingRegister","CalculationRegister","InformationRegister")
+	if ($registerTypes -contains $mdType -and $script:configDir -and $objName -ne "(unknown)") {
+		$needsRegistrar = $true
+		# InformationRegister with WriteMode=Independent does not need a registrar
+		if ($mdType -eq "InformationRegister") {
+			$writeMode = $propsNode.SelectSingleNode("md:WriteMode", $ns)
+			if (-not $writeMode -or $writeMode.InnerText -ne "RecorderSubordinate") {
+				$needsRegistrar = $false
+			}
+		}
+		if ($needsRegistrar) {
+			$regRef = "$mdType.$objName"
+			$docsDir = Join-Path $script:configDir "Documents"
+			$hasRegistrar = $false
+			if (Test-Path $docsDir) {
+				$docXmls = Get-ChildItem $docsDir -Filter "*.xml" -File -ErrorAction SilentlyContinue
+				foreach ($docXml in $docXmls) {
+					$content = [System.IO.File]::ReadAllText($docXml.FullName, [System.Text.Encoding]::UTF8)
+					if ($content.Contains($regRef)) {
+						$hasRegistrar = $true
+						break
+					}
+				}
+			}
+			if (-not $hasRegistrar) {
+				Report-Warn "10. $mdType`: no registrar document found (none references '$regRef' in RegisterRecords)"
+				$check10Issues++
+			}
+		}
+	}
+}
+
+if ($check10Ok -and $check10Issues -eq 0) {
+	Report-OK "10. Cross-property consistency"
+} elseif ($check10Ok) {
+	# Had warnings but no errors - already reported
+}
+
+if ($script:stopped) { & $finalize; exit 1 }
+
+# --- Check 11: HTTPService/WebService nested structure ---
+
+if ($mdType -eq "HTTPService" -and $childObjNode) {
+	$urlTemplates = $childObjNode.SelectNodes("md:URLTemplate", $ns)
+	$check11Ok = $true
+	$methodCount = 0
+
+	$validHTTPMethods = @("GET","POST","PUT","DELETE","PATCH","HEAD","OPTIONS","MERGE","CONNECT")
+
+	foreach ($ut in $urlTemplates) {
+		if ($script:stopped) { break }
+
+		$utProps = $ut.SelectSingleNode("md:Properties", $ns)
+		$utNameNode = if ($utProps) { $utProps.SelectSingleNode("md:Name", $ns) } else { $null }
+		$utName = if ($utNameNode) { $utNameNode.InnerText } else { "(unnamed)" }
+
+		# Template property
+		$tpl = if ($utProps) { $utProps.SelectSingleNode("md:Template", $ns) } else { $null }
+		if (-not $tpl -or -not $tpl.InnerText.Trim()) {
+			Report-Error "11. HTTPService URLTemplate '$utName': empty Template"
+			$check11Ok = $false
+		}
+
+		# Methods inside URLTemplate
+		$utChildObj = $ut.SelectSingleNode("md:ChildObjects", $ns)
+		if ($utChildObj) {
+			$methods = $utChildObj.SelectNodes("md:Method", $ns)
+			foreach ($m in $methods) {
+				$methodCount++
+				$mProps = $m.SelectSingleNode("md:Properties", $ns)
+				if ($mProps) {
+					$httpMethod = $mProps.SelectSingleNode("md:HTTPMethod", $ns)
+					if ($httpMethod -and $httpMethod.InnerText) {
+						if ($validHTTPMethods -notcontains $httpMethod.InnerText) {
+							Report-Error "11. HTTPService URLTemplate '$utName': invalid HTTPMethod '$($httpMethod.InnerText)'"
+							$check11Ok = $false
+						}
+					} else {
+						Report-Error "11. HTTPService URLTemplate '$utName': Method missing HTTPMethod"
+						$check11Ok = $false
+					}
+				}
+			}
+		}
+	}
+
+	if ($check11Ok) {
+		Report-OK "11. HTTPService: $($urlTemplates.Count) URLTemplate(s), $methodCount method(s)"
+	}
+} elseif ($mdType -eq "WebService" -and $childObjNode) {
+	$operations = $childObjNode.SelectNodes("md:Operation", $ns)
+	$check11Ok = $true
+	$paramCount = 0
+
+	$validDirections = @("In","Out","InOut")
+
+	foreach ($op in $operations) {
+		if ($script:stopped) { break }
+
+		$opProps = $op.SelectSingleNode("md:Properties", $ns)
+		$opNameNode = if ($opProps) { $opProps.SelectSingleNode("md:Name", $ns) } else { $null }
+		$opName = if ($opNameNode) { $opNameNode.InnerText } else { "(unnamed)" }
+
+		# ReturnType - XDTOReturningValueType
+		$retType = if ($opProps) { $opProps.SelectSingleNode("md:XDTOReturningValueType", $ns) } else { $null }
+		if (-not $retType -or -not $retType.InnerText.Trim()) {
+			Report-Warn "11. WebService Operation '$opName': no XDTOReturningValueType"
+		}
+
+		# Parameters inside Operation
+		$opChildObj = $op.SelectSingleNode("md:ChildObjects", $ns)
+		if ($opChildObj) {
+			$params = $opChildObj.SelectNodes("md:Parameter", $ns)
+			foreach ($p in $params) {
+				$paramCount++
+				$pProps = $p.SelectSingleNode("md:Properties", $ns)
+				if ($pProps) {
+					$dir = $pProps.SelectSingleNode("md:TransferDirection", $ns)
+					if ($dir -and $dir.InnerText -and $validDirections -notcontains $dir.InnerText) {
+						Report-Error "11. WebService Operation '$opName': Parameter has invalid TransferDirection '$($dir.InnerText)'"
+						$check11Ok = $false
+					}
+				}
+			}
+		}
+	}
+
+	if ($check11Ok) {
+		Report-OK "11. WebService: $($operations.Count) operation(s), $paramCount parameter(s)"
+	}
+}
+
+if ($script:stopped) { & $finalize; exit 1 }
+
+# --- Check 12: Forbidden properties per type ---
+
+if ($propsNode -and $forbiddenProperties.ContainsKey($mdType)) {
+	$forbidden = $forbiddenProperties[$mdType]
+	$check12Ok = $true
+	foreach ($fp in $forbidden) {
+		$fpNode = $propsNode.SelectSingleNode("md:$fp", $ns)
+		if ($fpNode) {
+			Report-Error "12. Forbidden property '$fp' present in $mdType (will fail on LoadConfigFromFiles)"
+			$check12Ok = $false
+		}
+	}
+	if ($check12Ok) {
+		Report-OK "12. Forbidden properties: none found"
+	}
+}
+
+if ($script:stopped) { & $finalize; exit 1 }
+
+# --- Check 13: Method reference validation (EventSubscription.Handler, ScheduledJob.MethodName) ---
+
+if ($propsNode -and $mdType -in @("EventSubscription","ScheduledJob") -and $script:configDir) {
+	$check13Ok = $true
+	$methodRef = $null
+	$propLabel = $null
+
+	if ($mdType -eq "EventSubscription") {
+		$hNode = $propsNode.SelectSingleNode("md:Handler", $ns)
+		if ($hNode) { $methodRef = $hNode.InnerText.Trim() }
+		$propLabel = "Handler"
+	} elseif ($mdType -eq "ScheduledJob") {
+		$mNode = $propsNode.SelectSingleNode("md:MethodName", $ns)
+		if ($mNode) { $methodRef = $mNode.InnerText.Trim() }
+		$propLabel = "MethodName"
+	}
+
+	if ($methodRef) {
+		$parts = $methodRef.Split('.')
+		# Format: CommonModule.ModuleName.ProcedureName (3 parts) or ModuleName.ProcedureName (2 parts, legacy)
+		if ($parts.Count -eq 3 -and $parts[0] -eq "CommonModule") {
+			$cmName = $parts[1]
+			$procName = $parts[2]
+		} elseif ($parts.Count -eq 2) {
+			$cmName = $parts[0]
+			$procName = $parts[1]
+		} else {
+			Report-Error "13. ${mdType}.${propLabel} = '$methodRef': expected format 'CommonModule.ModuleName.ProcedureName'"
+			$check13Ok = $false
+			$cmName = $null
+			$procName = $null
+		}
+		if ($cmName) {
+			$cmXml = Join-Path (Join-Path $script:configDir "CommonModules") "$cmName.xml"
+			if (-not (Test-Path $cmXml)) {
+				Report-Error "13. ${mdType}.${propLabel}: CommonModule '$cmName' not found (expected $cmXml)"
+				$check13Ok = $false
+			} else {
+				# Check BSL file for exported procedure
+				$bslPath = Join-Path (Join-Path (Join-Path $script:configDir "CommonModules") $cmName) "Ext/Module.bsl"
+				if (Test-Path $bslPath) {
+					$bslContent = [System.IO.File]::ReadAllText($bslPath, [System.Text.Encoding]::UTF8)
+					# Match: Procedure/Function ProcName(...) Export or Процедура/Функция ProcName(...) Экспорт
+					$exportPattern = "(?mi)^[\s]*(Procedure|Function|Процедура|Функция)\s+$([regex]::Escape($procName))\s*\(.*\)\s+(Export|Экспорт)"
+					if (-not [regex]::IsMatch($bslContent, $exportPattern)) {
+						Report-Warn "13. ${mdType}.${propLabel}: procedure '$procName' not found as exported in CommonModule '$cmName'"
+						$check13Ok = $false
+					}
+				} else {
+					Report-Warn "13. ${mdType}.${propLabel}: BSL file not found ($bslPath), cannot verify procedure"
+				}
+			}
+		}
+	}
+
+	if ($check13Ok) {
+		Report-OK "13. Method reference: $propLabel = '$methodRef'"
+	}
+}
+
+if ($script:stopped) { & $finalize; exit 1 }
+
+# --- Check 14: DocumentJournal Column content ---
+
+if ($mdType -eq "DocumentJournal" -and $childObjNode) {
+	$columns = $childObjNode.SelectNodes("md:Column", $ns)
+	$check14Ok = $true
+	$colCount = 0
+	$emptyRefCount = 0
+
+	foreach ($col in $columns) {
+		$colCount++
+		$colProps = $col.SelectSingleNode("md:Properties", $ns)
+		$colNameNode = if ($colProps) { $colProps.SelectSingleNode("md:Name", $ns) } else { $null }
+		$colName = if ($colNameNode) { $colNameNode.InnerText } else { "(unnamed)" }
+
+		$refs = if ($colProps) { $colProps.SelectSingleNode("md:References", $ns) } else { $null }
+		$hasItems = $false
+		if ($refs) {
+			$items = $refs.SelectNodes("xr:Item", $ns)
+			if ($items.Count -gt 0) { $hasItems = $true }
+		}
+		if (-not $hasItems) {
+			Report-Error "14. DocumentJournal Column '$colName': empty References (will fail on LoadConfigFromFiles)"
+			$check14Ok = $false
+			$emptyRefCount++
+		}
+	}
+
+	if ($check14Ok -and $colCount -gt 0) {
+		Report-OK "14. DocumentJournal Columns: $colCount column(s), all have References"
+	} elseif ($colCount -eq 0) {
+		Report-OK "14. DocumentJournal Columns: none"
+	}
+}
+
+# --- Check 16: Type references point to existing objects ---
+
+# Ссылочный тип узнается по форме имени: часть до первой точки кончается на Ref
+# (CatalogRef, DocumentRef, BusinessProcessRoutePointRef) либо это Characteristic или
+# DefinedType. Все прочее с точкой не трогаем - там может быть что угодно, а ложное
+# срабатывание дороже пропуска.
+function Test-MetadataRef([string]$typeName) {
+	$dot = $typeName.IndexOf(".")
+	if ($dot -le 0) { return $false }
+	$prefix = $typeName.Substring(0, $dot)
+	return ($prefix.EndsWith("Ref") -or $prefix -eq "Characteristic" -or $prefix -eq "DefinedType")
+}
+
+# Резерв на случай, когда индекса не дали: имя разбирается на префикс и объект, и объект
+# ищется файлом. Для ОДНОГО объекта это дешево; в индексе тот же ответ точнее и быстрее.
+$refPrefixDirMap = @{
+	"CatalogRef"="Catalogs"; "DocumentRef"="Documents"; "EnumRef"="Enums"
+	"ExchangePlanRef"="ExchangePlans"; "BusinessProcessRef"="BusinessProcesses"
+	"BusinessProcessRoutePointRef"="BusinessProcesses"; "TaskRef"="Tasks"
+	"ChartOfAccountsRef"="ChartsOfAccounts"
+	"ChartOfCharacteristicTypesRef"="ChartsOfCharacteristicTypes"
+	"ChartOfCalculationTypesRef"="ChartsOfCalculationTypes"
+	"Characteristic"="ChartsOfCharacteristicTypes"; "DefinedType"="DefinedTypes"
+}
+
+$indexTypes = $null
+$indexIsExtension = $false
+if ($IndexPath) {
+	try {
+		$indexRaw = [System.IO.File]::ReadAllText($IndexPath, [System.Text.Encoding]::UTF8)
+		$indexData = $indexRaw | ConvertFrom-Json
+		if ($indexData.format -ne 1) {
+			Report-Warn "16. Index format $($indexData.format) is not supported, cross-object check skipped"
+		} else {
+			$indexTypes = New-Object 'System.Collections.Generic.HashSet[string]'
+			foreach ($tn in $indexData.types) { [void]$indexTypes.Add([string]$tn) }
+			$indexIsExtension = ($indexData.kind -eq "extension")
+		}
+	} catch {
+		Report-Warn "16. Index could not be read ($($_.Exception.Message)), cross-object check skipped"
+	}
+}
+
+# Заимствованный объект живет в расширении: его типы могут ссылаться на основную конфигурацию,
+# которой в этой выгрузке нет. Тогда неизвестная ссылка - предупреждение, а не ошибка.
+$objectIsAdopted = $false
+if ($propsNode) {
+	$belonging = $propsNode.SelectSingleNode("md:ObjectBelonging", $ns)
+	if ($belonging -and $belonging.InnerText.Trim() -eq "Adopted") { $objectIsAdopted = $true }
+}
+$lenient = ($indexIsExtension -or $objectIsAdopted)
+
+# Пары "ссылка / где встретилась" из одного блока Type или ValueType.
+function Get-TypeRefs($container, [string]$label) {
+	$found = [System.Collections.ArrayList]::new()
+	if (-not $container) { return ,$found }
+	foreach ($holderTag in @("md:Type", "md:ValueType")) {
+		$holder = $container.SelectSingleNode($holderTag, $ns)
+		if (-not $holder) { continue }
+		foreach ($tag in @("v8:Type", "v8:TypeSet")) {
+			foreach ($node in $holder.SelectNodes($tag, $ns)) {
+				# Составной тип платформа пишет отдельным элементом на тип, но meta-compile
+				# для DefinedType складывает их в один через " + ". Принимаем оба вида.
+				foreach ($part in ($node.InnerText -split " \+ ")) {
+					$val = $part.Trim()
+					if ($val -eq "") { continue }
+					$colon = $val.IndexOf(":")
+					if ($colon -ge 0) { $val = $val.Substring($colon + 1) }
+					if (Test-MetadataRef $val) { [void]$found.Add(@($val, $label)) }
+				}
+			}
+		}
+	}
+	return ,$found
+}
+
+$typeRefs = [System.Collections.ArrayList]::new()
+if ($propsNode) {
+	foreach ($p in (Get-TypeRefs $propsNode $mdType)) { [void]$typeRefs.Add($p) }
+}
+if ($childObjNode) {
+	foreach ($child in $childObjNode.ChildNodes) {
+		if ($child.NodeType -ne [System.Xml.XmlNodeType]::Element) { continue }
+		$childProps = $child.SelectSingleNode("md:Properties", $ns)
+		if (-not $childProps) { continue }
+		$childNameNode = $childProps.SelectSingleNode("md:Name", $ns)
+		$childName = if ($childNameNode) { $childNameNode.InnerText.Trim() } else { "?" }
+		if ($child.LocalName -eq "TabularSection") {
+			$tsChildren = $child.SelectSingleNode("md:ChildObjects", $ns)
+			if (-not $tsChildren) { continue }
+			foreach ($tsAttr in $tsChildren.SelectNodes("md:Attribute", $ns)) {
+				$tsProps = $tsAttr.SelectSingleNode("md:Properties", $ns)
+				if (-not $tsProps) { continue }
+				$tsNameNode = $tsProps.SelectSingleNode("md:Name", $ns)
+				$tsName = if ($tsNameNode) { $tsNameNode.InnerText.Trim() } else { "?" }
+				foreach ($p in (Get-TypeRefs $tsProps "$childName.$tsName")) { [void]$typeRefs.Add($p) }
+			}
+		} else {
+			foreach ($p in (Get-TypeRefs $childProps "$($child.LocalName) $childName")) { [void]$typeRefs.Add($p) }
+		}
+	}
+}
+
+if ($typeRefs.Count -eq 0) {
+	Report-OK "16. Reference types: none to check"
+} elseif ($null -eq $indexTypes -and -not $script:configDir) {
+	Report-Warn "16. Reference types: $($typeRefs.Count) found, but neither -IndexPath nor configuration root is available - not checked"
+} else {
+	$check16Bad = 0
+	$seenRefs = New-Object 'System.Collections.Generic.HashSet[string]'
+	foreach ($pair in $typeRefs) {
+		if ($script:stopped) { break }
+		$ref = $pair[0]
+		$where = $pair[1]
+		if (-not $seenRefs.Add("$where`t$ref")) { continue }
+		if ($null -ne $indexTypes) {
+			$known = $indexTypes.Contains($ref)
+		} else {
+			$dot = $ref.IndexOf(".")
+			$prefix = $ref.Substring(0, $dot)
+			$refName = $ref.Substring($dot + 1)
+			$refDir = $refPrefixDirMap[$prefix]
+			if (-not $refDir) { continue }
+			$base = Join-Path (Join-Path $script:configDir $refDir) $refName
+			$known = ((Test-Path -LiteralPath $base) -or (Test-Path -LiteralPath "$base.xml"))
+		}
+		if ($known) { continue }
+		$check16Bad++
+		if ($lenient) {
+			Report-Warn "16. Ссылочный тип '$ref' не найден в этой выгрузке - ожидается в основной конфигурации ($where)"
+		} else {
+			Report-Warn "16. Ссылочный тип '$ref' не разрешается: объекта нет в конфигурации ($where)"
+		}
+	}
+	if ($check16Bad -eq 0) {
+		$source = if ($null -ne $indexTypes) { "index" } else { "configuration files" }
+		Report-OK "16. Reference types: $($seenRefs.Count) checked against $source, all resolve"
+	}
+}
+
+if ($script:stopped) { & $finalize; exit 1 }
+
+# --- Check 17: MDObjectRef указывает на объект метаданных, а не на тип ссылки ---
+
+# Владельцы, подчиненные объекты и подобные ссылки записываются полным именем объекта
+# (Catalog.Валюты). Имя типа ссылки (CatalogRef.Валюты) там же платформа не разрешает: тип
+# существует, объекта с таким именем нет, и загрузка обрывается.
+$check17Bad = 0
+$mdObjectRefs = $root.SelectNodes("//*[local-name()='Item']", $ns)
+foreach ($item in $mdObjectRefs) {
+	$xsiType = $item.GetAttribute("type", "http://www.w3.org/2001/XMLSchema-instance")
+	if ($xsiType -notmatch 'MDObjectRef$') { continue }
+	$refValue = $item.InnerText.Trim()
+	if (-not $refValue) { continue }
+	if ($refValue -match '^([A-Za-z]+)Ref\.') {
+		$baseType = $Matches[1]
+		Report-Error "17. MDObjectRef '$refValue' указывает на тип ссылки, ожидается объект метаданных: $baseType.$($refValue.Split('.')[1])"
+		$check17Bad++
+	}
+}
+if ($check17Bad -eq 0) {
+	Report-OK "17. MDObjectRef: ссылок на типы вместо объектов нет"
+}
+
+if ($script:stopped) { & $finalize; exit 1 }
+
+# --- Check 18: свойства новых версий формата в файле со старым штампом ---
+
+# Платформа читает файл по версии из его штампа: свойство, которого в этой версии еще не было,
+# она не понимает. Проверка сверяет найденные свойства с версией, в которой они появились.
+$propertyMinVersion = @{
+	"TypeReductionMode" = "2.18"
+	"LineNumberLength" = "2.20"
+	"MinClientPlatformVersion" = "2.19"
+	"UseMultilanguage" = "2.21"
+}
+
+$check18Bad = 0
+if ($version) {
+	foreach ($propName in $propertyMinVersion.Keys) {
+		$minVersion = $propertyMinVersion[$propName]
+		if ([version]$version -ge [version]$minVersion) { continue }
+		$found = $root.SelectNodes("//*[local-name()='$propName']", $ns)
+		if ($found.Count -gt 0) {
+			Report-Error "18. <$propName> появился в формате $minVersion, а файл объявлен как $version"
+			$check18Bad++
+		}
+	}
+}
+if ($check18Bad -eq 0) {
+	Report-OK "18. Свойства формата: несовместимых с версией файла нет"
+}
+
+if ($script:stopped) { & $finalize; exit 1 }
+
+# --- Check 19: длина номера строки табличной части ---
+
+# Диапазон задан платформой: значение вне 5..9 она отвергает при загрузке.
+$check19Bad = 0
+$lnlNodes = $root.SelectNodes("//*[local-name()='LineNumberLength']", $ns)
+foreach ($lnl in $lnlNodes) {
+	$lnlText = $lnl.InnerText.Trim()
+	$lnlValue = 0
+	if (-not [int]::TryParse($lnlText, [ref]$lnlValue)) {
+		Report-Error "19. LineNumberLength='$lnlText' не число"
+		$check19Bad++
+		continue
+	}
+	if ($lnlValue -lt 5 -or $lnlValue -gt 9) {
+		Report-Error "19. LineNumberLength=$lnlValue вне допустимого диапазона 5..9"
+		$check19Bad++
+	}
+}
+if ($check19Bad -eq 0) {
+	Report-OK "19. LineNumberLength: значения в допустимом диапазоне"
+}
+
+if ($script:stopped) { & $finalize; exit 1 }
+
+# --- Check 20: корневой тип и группы команд ---
+
+# Корневой тип плана видов характеристик - структура из элементов v8:Type, а не строка. Текст
+# вида "Boolean + String(20)" читается человеком, но платформой не разбирается.
+$check20Bad = 0
+# Свойства объекта лежат в узле типа, а команды - в ChildObjects: это разные узлы.
+if ($typeNode) {
+	$rootTypeNode = $typeNode.SelectSingleNode("md:Properties/md:Type", $ns)
+	if ($rootTypeNode) {
+		$hasTypeChildren = $rootTypeNode.SelectNodes("*").Count -gt 0
+		if (-not $hasTypeChildren -and $rootTypeNode.InnerText.Trim()) {
+			Report-Error "20. Корневой <Type> задан текстом '$($rootTypeNode.InnerText.Trim())', ожидается структура из элементов v8:Type"
+			$check20Bad++
+		}
+	}
+
+	# Команда без группы не попадает ни в один раздел интерфейса: платформа отвергает пустую
+	# группу при загрузке.
+	$commandNodes = if ($childObjNode) { $childObjNode.SelectNodes("md:Command", $ns) } else { @() }
+	foreach ($cmd in $commandNodes) {
+		$cmdProps = $cmd.SelectSingleNode("md:Properties", $ns)
+		if (-not $cmdProps) { continue }
+		$cmdNameNode = $cmdProps.SelectSingleNode("md:Name", $ns)
+		$cmdName = if ($cmdNameNode) { $cmdNameNode.InnerText } else { "?" }
+		$groupNode = $cmdProps.SelectSingleNode("md:Group", $ns)
+		if (-not $groupNode -or -not $groupNode.InnerText.Trim()) {
+			Report-Error "20. Команда '$cmdName': группа не задана"
+			$check20Bad++
+			continue
+		}
+		# Параметризуемая команда становится в группу формы, а не в раздел командного
+		# интерфейса: раздел не знает, откуда взять значение параметра.
+		$groupValue = $groupNode.InnerText.Trim()
+		$paramTypeNode = $cmdProps.SelectSingleNode("md:CommandParameterType", $ns)
+		$hasParamType = $paramTypeNode -and $paramTypeNode.SelectNodes("*").Count -gt 0
+		if ($hasParamType -and $groupValue -match '^(ActionsPanel|NavigationPanel)') {
+			Report-Error "20. Команда '$cmdName': группа '$groupValue' относится к разделу интерфейса, а у команды задан параметр - параметризуемой команде нужна группа формы"
+			$check20Bad++
+		}
+	}
+}
+if ($check20Bad -eq 0) {
+	Report-OK "20. Корневой тип и группы команд: замечаний нет"
+}
+
+if ($script:stopped) { & $finalize; exit 1 }
+
+# --- Final output ---
+
+& $finalize
+
+if ($script:errors -gt 0) {
+	exit 1
+}
+exit 0

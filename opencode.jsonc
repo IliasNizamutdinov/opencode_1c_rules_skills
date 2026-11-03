@@ -1,0 +1,26 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "skills": ["./skills"],
+  "command": {
+    "check-uuid": {
+      "description": "Проверить уникальность UUID в выгрузке 1С",
+      "template": "Прочитай commands/check-uuid.md и выполни эту команду. Аргументы пользователя: $ARGUMENTS"
+    },
+    "browser-debug": {
+      "description": "Запустить Яндекс Браузер с портом удаленной отладки",
+      "template": "Прочитай commands/browser-debug.md и выполни эту команду. Аргументы пользователя: $ARGUMENTS"
+    },
+    "docx-to-md": {
+      "description": "Конвертировать DOCX в Markdown",
+      "template": "Прочитай commands/docx-to-md.md и выполни эту команду. Аргументы пользователя: $ARGUMENTS"
+    },
+    "move-project": {
+      "description": "Перенести каталог проекта, не правя базу сессий OpenCode",
+      "template": "Прочитай commands/move-project.md и выполни эту команду. Аргументы пользователя: $ARGUMENTS"
+    },
+    "quality": {
+      "description": "Снятие гейта качества в OpenCode недоступно",
+      "template": "Прочитай commands/quality.md и выполни эту команду. Аргументы пользователя: $ARGUMENTS"
+    }
+  }
+}
