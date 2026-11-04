@@ -25,6 +25,7 @@
 Запуск:  python tools/validate_ruleset.py [--budget]
 Выход 1 при находках уровня ERROR.
 """
+import json
 import argparse
 import io
 import re
@@ -208,6 +209,28 @@ def check_links(problems):
             problems.append(("ERROR", str(path), f"ссылка на несуществующий файл: {name}"))
 
 
+def check_loading(problems):
+    """Каждый файл правила указан в instructions, каждый скилл доступен по пути загрузки."""
+    config_path = ROOT / "opencode.jsonc"
+    try:
+        config = json.loads(read(config_path))
+    except ValueError as exc:
+        problems.append(("ERROR", str(config_path), f"не читается как JSON: {exc}"))
+        return
+    listed = set(config.get("instructions") or [])
+    for rule in rule_files():
+        rel = rule.relative_to(ROOT).as_posix()
+        if rel not in listed:
+            problems.append(("ERROR", str(config_path), f"в instructions нет {rel}"))
+    skill_sources = set(config.get("skills") or [])
+    if "./skills" not in skill_sources:
+        problems.append(("ERROR", str(config_path), "в skills нет ./skills (каталог OpenCode 2)"))
+    for skill_dir in sorted(p for p in SKILLS_DIR.iterdir() if p.is_dir()):
+        loaded = ROOT / ".opencode" / "skills" / skill_dir.name / "SKILL.md"
+        if not loaded.is_file():
+            problems.append(("ERROR", str(loaded), "нет SKILL.md для загрузки OpenCode 1"))
+
+
 def check_readme_counters(problems, root=ROOT):
     """Сверить счетчики README с фактическим составом репозитория.
 
@@ -309,6 +332,7 @@ def main():
     problems = []
     check_frontmatter(problems)
     check_links(problems)
+    check_loading(problems)
     check_readme_counters(problems)
 
     always, conditional, descriptions = measure_budget()

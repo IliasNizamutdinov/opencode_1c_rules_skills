@@ -130,7 +130,7 @@ function Get-SourceItems {
 
 function Read-Manifest {
     $map = @{}
-    $meta = @{ agents_created = "0"; scope = $Scope }
+    $meta = @{ agents_created = "0"; config_created = "0"; scope = $Scope }
     if (-not (Test-Path -LiteralPath $ManifestPath)) { return @{ Map = $map; Meta = $meta } }
     $text = [IO.File]::ReadAllText($ManifestPath)
     foreach ($line in ($text -split "`n")) {
@@ -145,11 +145,16 @@ function Read-Manifest {
     return @{ Map = $map; Meta = $meta }
 }
 
-function Write-Manifest($Map, $AgentsCreated) {
+function Write-Manifest($Map, $AgentsCreated, $ConfigCreated) {
     if ($DryRun) { return }
     $dir = Split-Path -Parent $ManifestPath
     if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
-    $lines = @("# opencode-1c-kit`t1", "meta`tagents_created`t$AgentsCreated", "meta`tscope`t$Scope")
+    $lines = @(
+        "# opencode-1c-kit`t1",
+        "meta`tagents_created`t$AgentsCreated",
+        "meta`tconfig_created`t$ConfigCreated",
+        "meta`tscope`t$Scope"
+    )
     foreach ($rel in ($Map.Keys | Sort-Object)) {
         $row = $Map[$rel]
         $lines += "file`t$($row.Hash)`t$($row.Component)`t$rel"
@@ -182,6 +187,100 @@ function Confirm-Replace([string]$Dest, [string]$Src) {
         { $_ -in "q", "Q" } { throw "Установка прервана." }
         default { return $false }
     }
+}
+
+function Get-RuleInstructionPaths {
+    $root = (Resolve-Path -LiteralPath (Join-Path $Source "rules")).Path
+    if ($InstallGlobal) {
+        $prefix = ($ConfigRoot + "\1c-rules").Replace("\", "/")
+    } else {
+        $prefix = ".opencode/1c-rules"
+    }
+    $paths = New-Object System.Collections.Generic.List[string]
+    foreach ($file in (Get-ChildItem -LiteralPath $root -Recurse -Filter *.md | Where-Object { $_.Name -ne "README.md" } | Sort-Object FullName)) {
+        $rel = $file.FullName.Substring($root.Length).TrimStart("\", "/").Replace("\", "/")
+        $paths.Add("$prefix/$rel")
+    }
+    return $paths
+}
+
+function Get-OpenCodeConfigPath {
+    $dir = if ($InstallGlobal) { $ConfigRoot } else { $ProjectDir }
+    $json = Join-Path $dir "opencode.json"
+    $jsonc = Join-Path $dir "opencode.jsonc"
+    if (Test-Path -LiteralPath $json) { return $json }
+    if (Test-Path -LiteralPath $jsonc) { return $jsonc }
+    return $json
+}
+
+function Merge-OpenCodeConfig([string]$ConfigCreated) {
+    if (-not $DoRules) { return $ConfigCreated }
+    $dest = Get-OpenCodeConfigPath
+    $paths = @(Get-RuleInstructionPaths)
+    $existed = Test-Path -LiteralPath $dest
+    $data = @{}
+    if ($existed) {
+        $data = (Get-Content -LiteralPath $dest -Raw -Encoding UTF8) | ConvertFrom-Json
+    }
+    $instr = @()
+    if ($data.PSObject.Properties.Name -contains "instructions") {
+        $instr = @($data.instructions)
+    }
+    $kept = @($instr | Where-Object { $_ -and ($_ -replace '\\','/') -notlike "*1c-rules/*" })
+    $merged = @($kept + $paths)
+    $same = $existed -and (@($instr) -join "`n") -eq ($merged -join "`n")
+    if ($same) {
+        Write-Host "конфигурация OpenCode: instructions уже содержит все правила"
+        return $ConfigCreated
+    }
+    if ($DryRun) {
+        Write-Host "dry-run: обновить instructions в $dest ($($paths.Count) файлов)"
+        return $ConfigCreated
+    }
+    if ($existed) { Backup-File $dest | Out-Null }
+    if (-not $existed) {
+        $data = [pscustomobject]@{
+            '$schema' = "https://opencode.ai/config.json"
+            instructions = $merged
+        }
+        $ConfigCreated = "1"
+    } else {
+        $data | Add-Member -NotePropertyName instructions -NotePropertyValue $merged -Force
+    }
+    $parent = Split-Path -Parent $dest
+    if (-not (Test-Path -LiteralPath $parent)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
+    $json = $data | ConvertTo-Json -Depth 30
+    [IO.File]::WriteAllText($dest, $json + "`n", $Utf8)
+    Write-Host "instructions: $($paths.Count) файлов правил -> $dest"
+    return $ConfigCreated
+}
+
+function Remove-OpenCodeInstructions([string]$ConfigCreated) {
+    $dest = Get-OpenCodeConfigPath
+    if (-not (Test-Path -LiteralPath $dest)) { return "0" }
+    Backup-File $dest | Out-Null
+    $data = (Get-Content -LiteralPath $dest -Raw -Encoding UTF8) | ConvertFrom-Json
+    $instr = @()
+    if ($data.PSObject.Properties.Name -contains "instructions") {
+        $instr = @($data.instructions)
+    }
+    $kept = @($instr | Where-Object { $_ -and ($_ -replace '\\','/') -notlike "*1c-rules/*" })
+    if ($kept.Count -gt 0) {
+        $data | Add-Member -NotePropertyName instructions -NotePropertyValue $kept -Force
+    } elseif ($data.PSObject.Properties.Name -contains "instructions") {
+        $data.PSObject.Properties.Remove("instructions")
+    }
+    $names = @($data.PSObject.Properties.Name)
+    $onlySchema = ($names.Count -eq 0) -or (($names.Count -eq 1) -and ($names[0] -eq '$schema'))
+    if ($ConfigCreated -eq "1" -and $onlySchema) {
+        Remove-Item -LiteralPath $dest -Force
+        Write-Host "удален $dest (его создал установщик)"
+    } else {
+        $json = $data | ConvertTo-Json -Depth 30
+        [IO.File]::WriteAllText($dest, $json + "`n", $Utf8)
+        Write-Host "из $dest убраны пути правил набора"
+    }
+    return "0"
 }
 
 function Install-Tree {
@@ -242,8 +341,12 @@ function Install-Tree {
         }
     }
     $agentsCreated = $old.Meta["agents_created"]
-    if ($DoRules) { $agentsCreated = Update-AgentsBlock $agentsCreated }
-    if (-not $DryRun) { Write-Manifest $map $agentsCreated }
+    $configCreated = $old.Meta["config_created"]
+    if ($DoRules) {
+        $agentsCreated = Update-AgentsBlock $agentsCreated
+        $configCreated = Merge-OpenCodeConfig $configCreated
+    }
+    if (-not $DryRun) { Write-Manifest $map $agentsCreated $configCreated }
     Write-Host "Готово (${Scope}): поставлено $copied, без изменений $same, заменено $replaced, оставлено ваших $kept"
     Write-Host "Каталог: $Base"
     if ($DoRules) {
@@ -363,7 +466,11 @@ function Uninstall-Kit {
             $agentsCreated = "0"
         }
     }
-    Write-Manifest $map $agentsCreated
+    $configCreated = $old.Meta["config_created"]
+    if ($DoRules) {
+        $configCreated = Remove-OpenCodeInstructions $configCreated
+    }
+    Write-Manifest $map $agentsCreated $configCreated
     Write-Host "Удалено файлов: $removed, оставлено измененных: $kept"
 }
 

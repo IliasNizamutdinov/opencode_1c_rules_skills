@@ -148,6 +148,7 @@ STATE="$(mktemp -d)"
 mkdir -p "$STATE/old" "$STATE/new"
 AGENTS_CREATED=0
 OLD_AGENTS_CREATED=0
+CONFIG_CREATED=0
 
 dest_for() {
   # relpath is skills/..., commands/..., 1c-rules/...
@@ -240,6 +241,7 @@ write_manifest() {
   {
     echo -e "# opencode-1c-kit\t1"
     printf 'meta\tagents_created\t%s\n' "$AGENTS_CREATED"
+    printf 'meta\tconfig_created\t%s\n' "$CONFIG_CREATED"
     printf 'meta\tscope\t%s\n' "$SCOPE"
     local entry hash component rel
     for entry in "$STATE/new"/*; do
@@ -273,10 +275,143 @@ load_manifest() {
     if [[ "$kind" == "meta" && "$a" == "agents_created" ]]; then
       OLD_AGENTS_CREATED="$b"
       AGENTS_CREATED="$b"
+    elif [[ "$kind" == "meta" && "$a" == "config_created" ]]; then
+      CONFIG_CREATED="$b"
     elif [[ "$kind" == "file" ]]; then
       printf '%s\t%s\t%s\n' "$a" "$b" "$c" > "$STATE/old/$(manifest_key "$c")"
     fi
   done < "$MANIFEST"
+}
+
+# Подключает каждый markdown-файл правил через instructions.
+# OpenCode 1 и 2 склеивают этот массив с AGENTS.md.
+merge_opencode_config() {
+  [[ "$DO_RULES" -eq 1 ]] || return 0
+  local prefix dest list existed=0
+  if [[ "$SCOPE" == "project" ]]; then
+    prefix=".opencode/1c-rules"
+    if [[ -f "$PROJECT/opencode.json" ]]; then
+      dest="$PROJECT/opencode.json"
+    elif [[ -f "$PROJECT/opencode.jsonc" ]]; then
+      dest="$PROJECT/opencode.jsonc"
+    else
+      dest="$PROJECT/opencode.json"
+    fi
+  else
+    prefix="${CONFIG_ROOT}/1c-rules"
+    prefix="${prefix//\\//}"
+    if [[ -f "$CONFIG_ROOT/opencode.json" ]]; then
+      dest="$CONFIG_ROOT/opencode.json"
+    elif [[ -f "$CONFIG_ROOT/opencode.jsonc" ]]; then
+      dest="$CONFIG_ROOT/opencode.jsonc"
+    else
+      dest="$CONFIG_ROOT/opencode.json"
+    fi
+  fi
+  [[ -f "$dest" ]] && existed=1
+  list="$(mktemp)"
+  find "$SOURCE/rules" -type f -name '*.md' ! -name 'README.md' | sort | while IFS= read -r file; do
+    printf '%s/%s\n' "$prefix" "${file#"$SOURCE/rules/"}"
+  done > "$list"
+  local marker status
+  marker="$(mktemp)"
+  set +e
+  python3 - "$dest" "$list" "$DRY" "$marker" <<'PY'
+import json, sys
+from pathlib import Path
+dest, list_path, dry, marker = sys.argv[1:]
+dry = dry == "1"
+paths = [line.strip().replace("\\", "/") for line in Path(list_path).read_text(encoding="utf-8").splitlines() if line.strip()]
+file = Path(dest)
+existed = file.exists()
+data = {}
+if existed:
+    data = json.loads(file.read_text(encoding="utf-8"))
+instr = data.get("instructions") or []
+if isinstance(instr, str):
+    instr = [instr]
+kept = [item for item in instr if "1c-rules/" not in str(item).replace("\\", "/")]
+merged = kept + paths
+if existed and list(instr) == merged:
+    print("конфигурация OpenCode: instructions уже содержит все правила")
+    raise SystemExit(0)
+if dry:
+    print(f"dry-run: обновить instructions в {dest} ({len(paths)} файлов)")
+    raise SystemExit(0)
+if existed:
+    raise SystemExit(10)
+file.parent.mkdir(parents=True, exist_ok=True)
+data["$schema"] = data.get("$schema") or "https://opencode.ai/config.json"
+data["instructions"] = merged
+file.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+Path(marker).write_text("1", encoding="utf-8")
+print(f"instructions: {len(paths)} файлов правил -> {dest}")
+PY
+  status=$?
+  set -e
+  if [[ "$status" -eq 10 && "$DRY" -eq 0 ]]; then
+    backup_dest "$dest" "opencode.json" >/dev/null
+    python3 - "$dest" "$list" <<'PY'
+import json, sys
+from pathlib import Path
+dest, list_path = sys.argv[1:]
+paths = [line.strip().replace("\\", "/") for line in Path(list_path).read_text(encoding="utf-8").splitlines() if line.strip()]
+file = Path(dest)
+data = json.loads(file.read_text(encoding="utf-8"))
+instr = data.get("instructions") or []
+if isinstance(instr, str):
+    instr = [instr]
+kept = [item for item in instr if "1c-rules/" not in str(item).replace("\\", "/")]
+data["instructions"] = kept + paths
+file.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+print(f"instructions: {len(paths)} файлов правил -> {dest}")
+PY
+  elif [[ "$status" -ne 0 && "$status" -ne 10 ]]; then
+    rm -f "$marker" "$list"
+    return "$status"
+  fi
+  if [[ -s "$marker" ]]; then
+    CONFIG_CREATED=1
+  fi
+  rm -f "$marker" "$list"
+}
+
+strip_opencode_config() {
+  [[ "$DO_RULES" -eq 1 ]] || return 0
+  local dest=""
+  if [[ "$SCOPE" == "project" ]]; then
+    if [[ -f "$PROJECT/opencode.json" ]]; then dest="$PROJECT/opencode.json"
+    elif [[ -f "$PROJECT/opencode.jsonc" ]]; then dest="$PROJECT/opencode.jsonc"
+    fi
+  else
+    if [[ -f "$CONFIG_ROOT/opencode.json" ]]; then dest="$CONFIG_ROOT/opencode.json"
+    elif [[ -f "$CONFIG_ROOT/opencode.jsonc" ]]; then dest="$CONFIG_ROOT/opencode.jsonc"
+    fi
+  fi
+  [[ -n "$dest" && -f "$dest" ]] || return 0
+  backup_dest "$dest" "opencode.json" >/dev/null
+  python3 - "$dest" "$CONFIG_CREATED" <<'PY'
+import json, sys
+from pathlib import Path
+dest, created = sys.argv[1:]
+file = Path(dest)
+data = json.loads(file.read_text(encoding="utf-8"))
+instr = data.get("instructions") or []
+if isinstance(instr, str):
+    instr = [instr]
+kept = [item for item in instr if "1c-rules/" not in str(item).replace("\\", "/")]
+if kept:
+    data["instructions"] = kept
+else:
+    data.pop("instructions", None)
+only_schema = set(data) <= {"$schema"} or not data
+if created == "1" and only_schema:
+    file.unlink()
+    print(f"удален {dest} (его создал установщик)")
+else:
+    file.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    print(f"из {dest} убраны пути правил набора")
+PY
 }
 
 apply_agents_block() {
@@ -460,6 +595,10 @@ cmd_uninstall() {
     fi
     AGENTS_CREATED=0
   fi
+  strip_opencode_config
+  if [[ "$DO_RULES" -eq 1 ]]; then
+    CONFIG_CREATED=0
+  fi
   # пересобрать манифест без удаленных компонентов
   DO_RULES_SAVED=$DO_RULES
   DO_SKILLS_SAVED=$DO_SKILLS
@@ -484,6 +623,7 @@ cmd_install() {
   done < "$SOURCES_FILE"
   remove_obsolete
   apply_agents_block
+  merge_opencode_config
   if [[ "$DRY" -eq 0 ]]; then
     write_manifest
   fi

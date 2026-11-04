@@ -17,7 +17,7 @@
 
 В репозитории **49 правил**. Они лежат в `rules/` по разделам: `bsl`, `queries`, `performance`, `metadata`, `forms`, `extensions`, `bsp`, `skd`, `security`, `exchange`, `workflow`.
 
-OpenCode не подключает правило по маске файла. Файл `AGENTS.md` говорит, какой документ прочитать перед правкой. После установки тот же указатель попадает в проектный или глобальный `AGENTS.md`. Полный текст всех правил в каждый ход не подставляется: это сознательное ограничение относительно Cursor, оно описано в [docs/migration.md](docs/migration.md).
+OpenCode 1 и OpenCode 2 загружают их через массив `instructions` в `opencode.json` и склеивают с `AGENTS.md`. В `opencode.jsonc` этого репозитория перечислен каждый из 49 файлов. После установки в проект те же пути указывают на `.opencode/1c-rules/`. Подробности и отличия версий — в [docs/installation.md](docs/installation.md).
 
 Каталог с условиями чтения — [docs/rules-catalog.md](docs/rules-catalog.md).
 
@@ -268,7 +268,7 @@ OpenCode не подключает правило по маске файла. Ф
 
 ## Каталог правил
 
-Правила лежат в `rules/<раздел>/`. OpenCode не подключает их по маске файлов: агент читает файл, когда задача совпадает с указателем в `AGENTS.md`.
+Правила лежат в `rules/<раздел>/`. Каждый файл указан в `instructions` файла `opencode.jsonc`, и OpenCode 1 и 2 загружают его вместе с `AGENTS.md`.
 
 ## BSL и клиент-сервер
 
@@ -432,10 +432,11 @@ cd ~/src/opencode_1c_rules_skills
 
 ## Ограничения
 
-- Нет автоподключения правил по glob. Есть указатель и необязательный массив `instructions`.
+- Все 49 правил перечислены в `instructions` и загружаются вместе с `AGENTS.md` в OpenCode 1 и OpenCode 2.
+- Скиллы OpenCode 1 читает из `.opencode/skills` (в репозитории это ссылки на `skills/`). OpenCode 2 читает и этот каталог, и `skills` из `opencode.jsonc`. На Windows без `core.symlinks` ссылки могут стать текстовыми файлами: тогда поставьте набор скриптом, он копирует каталоги.
 - Команда `/quality` не пишет след: хука из исходного набора в репозитории нет.
 - Перенос сессий OpenCode при смене пути проекта не делается правкой `opencode.db`.
-- `install.ps1` в среде сборки этого релиза не запускался, сценарии покрыты `install.sh`. На Windows прогоните `powershell -NoProfile -File .\install.ps1 -List`.
+- `install.ps1` на Linux не запускался: в среде сборки нет PowerShell. На Windows прогоните `powershell -NoProfile -File .\install.ps1 -List`.
 - Снапшот-тесты скриптов и работа платформы, EDT и MCP здесь не выполнялись.
 
 Подробности — [docs/migration.md](docs/migration.md).
@@ -444,9 +445,10 @@ cd ~/src/opencode_1c_rules_skills
 
 ```text
 AGENTS.md              указатель правил для OpenCode
-opencode.jsonc         скиллы репозитория и тексты команд
+opencode.jsonc         все правила в instructions и каталоги скиллов
 rules/                 49 правил по разделам
-skills/                121 скилл
+skills/                121 скилл, исходные каталоги
+.opencode/skills/      ссылки на skills/ для загрузки в OpenCode 1
 commands/              команды и скрипт проверки UUID
 templates/             блок указателя для установщика
 docs/                  установка, каталоги, зависимости, перенос

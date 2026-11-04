@@ -21,6 +21,7 @@ run "$INSTALL" --non-interactive --project "$PROJ" --skills-only
 [[ -f "$PROJ/.opencode/skills/1c-cf-info/SKILL.md" ]] || fail "скилл не скопирован"
 [[ ! -d "$PROJ/.opencode/1c-rules" ]] || fail "правила попали в установку только скиллов"
 [[ ! -f "$PROJ/AGENTS.md" ]] || fail "AGENTS.md создан без правил"
+[[ ! -f "$PROJ/opencode.json" ]] || fail "opencode.json создан без правил"
 grep -q "1c-cf-info" "$PROJ/.opencode/1c-kit-manifest.tsv" || fail "нет записи в манифесте"
 
 echo "== повтор без изменений =="
@@ -51,6 +52,14 @@ run "$INSTALL" --non-interactive --yes --project "$PROJ" --rules-only
 grep -q 'Мои инструкции' "$PROJ/AGENTS.md" || fail "свой текст пропал"
 grep -q '1c-opencode-rules:start' "$PROJ/AGENTS.md" || fail "блок не добавлен"
 [[ -f "$PROJ/.opencode/1c-rules/bsl/async-methods-1c.md" ]] || fail "правило не на месте"
+python3 - "$PROJ/opencode.json" <<'PY' || fail "не все правила попали в instructions"
+import json, sys
+data = json.load(open(sys.argv[1], encoding="utf-8"))
+items = data.get("instructions") or []
+need = ".opencode/1c-rules/bsl/async-methods-1c.md"
+if need not in items or len(items) < 49:
+    raise SystemExit(1)
+PY
 
 echo "== глобально, только команды =="
 run "$INSTALL" --non-interactive --global --commands-only
@@ -72,6 +81,7 @@ run "$INSTALL" --non-interactive --yes --project "$PROJ" --uninstall --rules-onl
 grep -q 'Мои инструкции' "$PROJ/AGENTS.md" || fail "свой текст удален вместе с блоком"
 grep -q '1c-opencode-rules:start' "$PROJ/AGENTS.md" && fail "блок правил остался"
 [[ ! -f "$PROJ/.opencode/1c-rules/bsl/async-methods-1c.md" ]] || fail "правило не удалено"
+[[ ! -f "$PROJ/opencode.json" ]] || fail "созданный установщиком opencode.json не удален"
 
 echo "== пустой проект: установка и полное удаление AGENTS.md =="
 PROJ2="$WORK/proj2"
@@ -79,5 +89,30 @@ mkdir -p "$PROJ2"
 run "$INSTALL" --non-interactive --project "$PROJ2" --rules-only
 run "$INSTALL" --non-interactive --yes --project "$PROJ2" --uninstall --rules-only
 [[ ! -f "$PROJ2/AGENTS.md" ]] || fail "созданный установщиком AGENTS.md не удален"
+[[ ! -f "$PROJ2/opencode.json" ]] || fail "созданный установщиком opencode.json не удален"
+
+echo "== свой opencode.json сохраняет чужие ключи =="
+PROJ3="$WORK/proj3"
+mkdir -p "$PROJ3"
+printf '%s\n' '{"model":"keep-me"}' > "$PROJ3/opencode.json"
+run "$INSTALL" --non-interactive --project "$PROJ3" --rules-only
+python3 - "$PROJ3/opencode.json" <<'PY' || fail "чужой ключ opencode.json потерян или правила не добавлены"
+import json, sys
+data = json.load(open(sys.argv[1], encoding="utf-8"))
+if data.get("model") != "keep-me":
+    raise SystemExit(1)
+if ".opencode/1c-rules/workflow/model-selection.md" not in data.get("instructions", []):
+    raise SystemExit(2)
+PY
+run "$INSTALL" --non-interactive --yes --project "$PROJ3" --uninstall --rules-only
+python3 - "$PROJ3/opencode.json" <<'PY' || fail "после удаления чужой opencode.json испорчен"
+import json, sys
+data = json.load(open(sys.argv[1], encoding="utf-8"))
+if data.get("model") != "keep-me":
+    raise SystemExit(1)
+items = data.get("instructions") or []
+if any("1c-rules/" in item for item in items):
+    raise SystemExit(2)
+PY
 
 echo "OK"
