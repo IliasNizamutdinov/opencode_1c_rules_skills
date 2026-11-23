@@ -265,6 +265,8 @@ GENERATED_TYPES = {
     ],
 }
 
+# Пустой <ChildObjects/> обязателен и у Adopted-подсистемы: без него загрузка расширения
+# падает с "ожидаемое ChildObjects". Детей исходной подсистемы сюда не копируют.
 TYPES_WITH_CHILD_OBJECTS = [
     "Catalog", "Document", "ExchangePlan", "ChartOfAccounts",
     "ChartOfCharacteristicTypes", "ChartOfCalculationTypes",
@@ -272,6 +274,7 @@ TYPES_WITH_CHILD_OBJECTS = [
     "InformationRegister", "AccumulationRegister", "AccountingRegister", "CalculationRegister",
     "Report", "DataProcessor", "DocumentJournal", "Sequence",
     "FilterCriterion", "SettingsStorage", "HTTPService", "WebService",
+    "Subsystem",
 ]
 
 COMMON_MODULE_PROPS = ["Global", "ClientManagedApplication", "Server", "ExternalConnection", "ClientOrdinaryApplication", "ServerCall"]

@@ -293,14 +293,17 @@ $script:generatedTypes = @{
 	)
 }
 
-# Types that need ChildObjects element
+# Пустой <ChildObjects/> нужен типам, у которых платформа ждет этот элемент.
+# Subsystem обязателен и у Adopted-подсистемы: без него LoadConfigFromFiles
+# сообщает "ожидаемое ChildObjects". Детей исходной подсистемы не копируем.
 $typesWithChildObjects = @(
 	"Catalog","Document","ExchangePlan","ChartOfAccounts",
 	"ChartOfCharacteristicTypes","ChartOfCalculationTypes",
 	"BusinessProcess","Task","Enum",
 	"InformationRegister","AccumulationRegister","AccountingRegister","CalculationRegister",
 	"Report","DataProcessor","DocumentJournal","Sequence",
-	"FilterCriterion","SettingsStorage","HTTPService","WebService"
+	"FilterCriterion","SettingsStorage","HTTPService","WebService",
+	"Subsystem"
 )
 
 # CommonModule properties to copy from source
