@@ -157,10 +157,14 @@ dest_for() {
 
 confirm_replace() {
   local dest="$1" src="$2"
+  # Ранний выход не открывает файл-источник. Если это процессная подстановка
+  # printf, непрочитанный канал дает SIGPIPE, а pipefail меняет код ветки if.
   if [[ "$REPLACE_ALL" -eq 1 ]]; then
+    [[ -n "$src" && -e "$src" ]] && cat "$src" >/dev/null || true
     return 0
   fi
   if [[ "$NONINTERACTIVE" -eq 1 || "$DRY" -eq 1 ]]; then
+    [[ -n "$src" && -e "$src" ]] && cat "$src" >/dev/null || true
     return 1
   fi
   echo "Файл уже есть и отличается от версии набора:"
