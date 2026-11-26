@@ -41,14 +41,18 @@ function Remove-FormDataPaths([string]$Xml, [bool]$KeepObjectPaths) {
 		}
 		$px = $m.Groups['px'].Value
 		$closeName = if ($px) { "${px}:$($m.Groups['ln'].Value)" } else { $m.Groups['ln'].Value }
-		$close = [regex]::Match($Xml, [regex]::Escape("</$closeName>"), $m.Index + $m.Length)
-		if (-not $close.Success) {
+		# Статический [regex]::Match(input, pattern, int) в Windows PowerShell 5.1
+		# принимает третьим аргументом RegexOptions, а не позицию. IndexOf ищет
+		# закрывающий тег от конца открывающего.
+		$closeNeedle = "</$closeName>"
+		$closeAt = $Xml.IndexOf($closeNeedle, $m.Index + $m.Length)
+		if ($closeAt -lt 0) {
 			[void]$sb.Append($Xml.Substring($i, $m.Index + $m.Length - $i))
 			$i = $m.Index + $m.Length
 			continue
 		}
-		$value = $Xml.Substring($m.Index + $m.Length, $close.Index - ($m.Index + $m.Length)).Trim()
-		$end = $close.Index + $close.Length
+		$value = $Xml.Substring($m.Index + $m.Length, $closeAt - ($m.Index + $m.Length)).Trim()
+		$end = $closeAt + $closeNeedle.Length
 		if ($KeepObjectPaths -and $value.StartsWith('Объект.')) {
 			[void]$sb.Append($Xml.Substring($i, $end - $i))
 		} else {
@@ -80,14 +84,15 @@ function Remove-BlocksWithoutDataPath([string]$Xml, [string]$LocalName) {
 		}
 		$px = $m.Groups['px'].Value
 		$closeName = if ($px) { "${px}:${LocalName}" } else { $LocalName }
-		$close = [regex]::Match($Xml, [regex]::Escape("</$closeName>"), $m.Index + $m.Length)
-		if (-not $close.Success) {
+		$closeNeedle = "</$closeName>"
+		$closeAt = $Xml.IndexOf($closeNeedle, $m.Index + $m.Length)
+		if ($closeAt -lt 0) {
 			[void]$sb.Append($Xml.Substring($i, $m.Index + $m.Length - $i))
 			$i = $m.Index + $m.Length
 			continue
 		}
-		$inner = $Xml.Substring($m.Index + $m.Length, $close.Index - ($m.Index + $m.Length))
-		$end = $close.Index + $close.Length
+		$inner = $Xml.Substring($m.Index + $m.Length, $closeAt - ($m.Index + $m.Length))
+		$end = $closeAt + $closeNeedle.Length
 		if ($hasPath.IsMatch($inner)) {
 			[void]$sb.Append($Xml.Substring($i, $end - $i))
 		} else {

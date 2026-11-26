@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # Проверка установщика на временных каталогах. Не трогает домашний каталог агента.
 set -euo pipefail
+fail() { echo "FAIL: $*" >&2; exit 1; }
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 export HOME="$WORK/home"
+unset XDG_CONFIG_HOME
 mkdir -p "$HOME"
 PROJ="$WORK/proj"
 mkdir -p "$PROJ"
