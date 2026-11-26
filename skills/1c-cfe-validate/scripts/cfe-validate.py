@@ -24,6 +24,23 @@ def format_version_known(version):
     return _format_version_rank(FORMAT_VERIFIED_MIN) <= rank <= _format_version_rank(FORMAT_VERIFIED_MAX)
 
 
+_DATA_PATH_ELEMENT = re.compile(
+    r'<((?:[A-Za-z_][\w.-]*:)?)([A-Za-z_](?:[\w.-]*DataPath|ataPath))\b[^>]*>([^<]*)</\1\2>'
+    r'|<(?:[A-Za-z_][\w.-]*:)?([A-Za-z_](?:[\w.-]*DataPath|ataPath))\b[^>]*/>'
+)
+
+
+def iter_form_data_paths(raw):
+    """Все элементы формы, локальное имя которых заканчивается на DataPath."""
+    if not raw:
+        return
+    for m in _DATA_PATH_ELEMENT.finditer(raw):
+        local = m.group(2) or m.group(4)
+        if not local or not local.endswith('DataPath'):
+            continue
+        yield local, (m.group(3) or '').strip()
+
+
 # Сообщение о рассинхроне версии формата части и дескриптора.
 def format_version_mismatch_message(part_version, descriptor_version, part_label, descriptor_label):
     return "Format version '%s' does not match descriptor version '%s' (%s vs %s)" % (part_version, descriptor_version, part_label, descriptor_label)
@@ -1080,8 +1097,7 @@ def main():
                 r.warn(f'14. {ctx}: cannot parse {dir_name}/{obj_name}.xml: {e}')
                 continue
             reported = set()
-            for m in re.finditer(r'<(?:DataPath|TitleDataPath)>([^<]+)</(?:DataPath|TitleDataPath)>', raw):
-                path = m.group(1).strip()
+            for local, path in iter_form_data_paths(raw):
                 segments = path.split('.')
                 if len(segments) < 2 or segments[0] != main_name:
                     continue
@@ -1140,6 +1156,25 @@ def main():
         r.ok('15. AdditionalColumns: none found')
     elif check15_ok:
         r.ok(f'15. AdditionalColumns: {add_col_count} table(s) borrowed')
+
+    # --- Check 16: any data path in a borrowed form that does not declare a main attribute ---
+    # Платформа разрешает путь только по секции реквизитов расширения. Без основного
+    # реквизита Объект любой DataPath, включая xr:DataPath, дает "Неверный путь к полю".
+    check16_ok = True
+    stray_count = 0
+    for bf in borrowed_forms_with_tree:
+        raw = bf['RawText']
+        ctx = bf['Context']
+        if '<MainAttribute>true</MainAttribute>' in raw:
+            continue
+        for local, path in iter_form_data_paths(raw):
+            stray_count += 1
+            r.error(f'16. {ctx}: data path "{path}" ({local}) in a borrowed form without a main attribute')
+            check16_ok = False
+    if not borrowed_forms_with_tree:
+        r.ok('16. Form data paths without main attribute: no borrowed forms with tree')
+    elif check16_ok:
+        r.ok('16. Form data paths without main attribute: clean')
 
     # --- Final output ---
     r.finalize(out_file)

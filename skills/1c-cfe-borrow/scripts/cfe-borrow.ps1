@@ -20,6 +20,92 @@ function Get-TightXml([string]$xml) {
 	return [regex]::Replace($xml, '(?s)<!\[CDATA\[.*?\]\]>|<!--.*?-->|<([A-Za-z0-9_:.\-]+)((?:\s+[A-Za-z0-9_:.\-]+="[^"]*")*)\s+/>', { param($m) if ($m.Groups[1].Success) { '<' + $m.Groups[1].Value + $m.Groups[2].Value + '/>' } else { $m.Value } })
 }
 
+function Remove-FormDataPaths([string]$Xml, [bool]$KeepObjectPaths) {
+	if ([string]::IsNullOrEmpty($Xml)) { return $Xml }
+	$rx = [regex]'<(?:(?<px>[A-Za-z_][\w.-]*):)?(?<ln>[A-Za-z_](?:[\w.-]*DataPath|ataPath))\b(?<attrs>[^>]*?)(?<sc>/)?>'
+	$sb = New-Object System.Text.StringBuilder
+	$i = 0
+	while ($i -lt $Xml.Length) {
+		$m = $rx.Match($Xml, $i)
+		if (-not $m.Success -or -not $m.Groups['ln'].Value.EndsWith('DataPath')) {
+			[void]$sb.Append($Xml.Substring($i))
+			break
+		}
+		$start = $m.Index
+		$j = $start
+		while ($j -gt $i -and [char]::IsWhiteSpace($Xml[$j - 1])) { $j-- }
+		if ($m.Groups['sc'].Value -eq '/') {
+			[void]$sb.Append($Xml.Substring($i, $j - $i))
+			$i = $m.Index + $m.Length
+			continue
+		}
+		$px = $m.Groups['px'].Value
+		$closeName = if ($px) { "${px}:$($m.Groups['ln'].Value)" } else { $m.Groups['ln'].Value }
+		$close = [regex]::Match($Xml, [regex]::Escape("</$closeName>"), $m.Index + $m.Length)
+		if (-not $close.Success) {
+			[void]$sb.Append($Xml.Substring($i, $m.Index + $m.Length - $i))
+			$i = $m.Index + $m.Length
+			continue
+		}
+		$value = $Xml.Substring($m.Index + $m.Length, $close.Index - ($m.Index + $m.Length)).Trim()
+		$end = $close.Index + $close.Length
+		if ($KeepObjectPaths -and $value.StartsWith('Объект.')) {
+			[void]$sb.Append($Xml.Substring($i, $end - $i))
+		} else {
+			[void]$sb.Append($Xml.Substring($i, $j - $i))
+		}
+		$i = $end
+	}
+	return $sb.ToString()
+}
+
+function Remove-BlocksWithoutDataPath([string]$Xml, [string]$LocalName) {
+	if ([string]::IsNullOrEmpty($Xml)) { return $Xml }
+	$rx = [regex]('<(?:(?<px>[A-Za-z_][\w.-]*):)?(?<ln>' + [regex]::Escape($LocalName) + ')\b(?<attrs>[^>]*?)(?<sc>/)?>')
+	$hasPath = [regex]'<(?:[A-Za-z_][\w.-]*:)?[A-Za-z_](?:[\w.-]*DataPath|ataPath)\b'
+	$sb = New-Object System.Text.StringBuilder
+	$i = 0
+	while ($i -lt $Xml.Length) {
+		$m = $rx.Match($Xml, $i)
+		if (-not $m.Success -or $m.Groups['ln'].Value -cne $LocalName) {
+			[void]$sb.Append($Xml.Substring($i))
+			break
+		}
+		$j = $m.Index
+		while ($j -gt $i -and [char]::IsWhiteSpace($Xml[$j - 1])) { $j-- }
+		if ($m.Groups['sc'].Value -eq '/') {
+			[void]$sb.Append($Xml.Substring($i, $j - $i))
+			$i = $m.Index + $m.Length
+			continue
+		}
+		$px = $m.Groups['px'].Value
+		$closeName = if ($px) { "${px}:${LocalName}" } else { $LocalName }
+		$close = [regex]::Match($Xml, [regex]::Escape("</$closeName>"), $m.Index + $m.Length)
+		if (-not $close.Success) {
+			[void]$sb.Append($Xml.Substring($i, $m.Index + $m.Length - $i))
+			$i = $m.Index + $m.Length
+			continue
+		}
+		$inner = $Xml.Substring($m.Index + $m.Length, $close.Index - ($m.Index + $m.Length))
+		$end = $close.Index + $close.Length
+		if ($hasPath.IsMatch($inner)) {
+			[void]$sb.Append($Xml.Substring($i, $end - $i))
+		} else {
+			[void]$sb.Append($Xml.Substring($i, $j - $i))
+		}
+		$i = $end
+	}
+	return $sb.ToString()
+}
+
+function Clear-BorrowedFormFragment([string]$Xml, [bool]$KeepObjectPaths) {
+	if ([string]::IsNullOrEmpty($Xml)) { return $Xml }
+	$Xml = Remove-FormDataPaths $Xml $KeepObjectPaths
+	$Xml = Remove-BlocksWithoutDataPath $Xml 'Link'
+	$Xml = Remove-BlocksWithoutDataPath $Xml 'ChoiceParameterLinks'
+	return $Xml
+}
+
 # --- 1. Resolve paths ---
 if (-not [System.IO.Path]::IsPathRooted($ExtensionPath)) {
 	$ExtensionPath = Join-Path (Get-Location).Path $ExtensionPath
@@ -604,13 +690,7 @@ function Borrow-Form {
 		$autoCmdXml = $autoCmdXml -replace '<Autofill>true</Autofill>', '<Autofill>false</Autofill>'
 		# Strip ExcludedCommand (references to standard commands invalid in extension)
 		$autoCmdXml = [regex]::Replace($autoCmdXml, '\s*<ExcludedCommand>[^<]*</ExcludedCommand>', '')
-		# Strip DataPath in AutoCommandBar buttons
-		if ($BorrowMainAttr) {
-			# Keep only Объект.* DataPaths
-			$autoCmdXml = [regex]::Replace($autoCmdXml, '\s*<DataPath>(?!Объект\.)[^<]*</DataPath>', '')
-		} else {
-			$autoCmdXml = [regex]::Replace($autoCmdXml, '\s*<DataPath>[^<]*</DataPath>', '')
-		}
+		$autoCmdXml = Clear-BorrowedFormFragment $autoCmdXml ([bool]$BorrowMainAttr)
 	}
 
 	# ChildItems: copy full tree, clean up base-config references
@@ -620,22 +700,9 @@ function Borrow-Form {
 		$childItemsXml = [regex]::Replace($childItemsXml, $nsStripPattern, '')
 		# Replace all CommandName values with 0
 		$childItemsXml = [regex]::Replace($childItemsXml, '<CommandName>[^<]*</CommandName>', '<CommandName>0</CommandName>')
-		# Strip DataPath, TitleDataPath, RowPictureDataPath
-		if ($BorrowMainAttr) {
-			# Keep only Объект.* DataPaths - strip form-attribute DataPaths (not borrowed)
-			$childItemsXml = [regex]::Replace($childItemsXml, '\s*<DataPath>(?!Объект\.)[^<]*</DataPath>', '')
-			$childItemsXml = [regex]::Replace($childItemsXml, '\s*<TitleDataPath>(?!Объект\.)[^<]*</TitleDataPath>', '')
-			$childItemsXml = [regex]::Replace($childItemsXml, '\s*<RowPictureDataPath>[^<]*</RowPictureDataPath>', '')
-		} else {
-			$childItemsXml = [regex]::Replace($childItemsXml, '\s*<DataPath>[^<]*</DataPath>', '')
-			$childItemsXml = [regex]::Replace($childItemsXml, '\s*<TitleDataPath>[^<]*</TitleDataPath>', '')
-			$childItemsXml = [regex]::Replace($childItemsXml, '\s*<RowPictureDataPath>[^<]*</RowPictureDataPath>', '')
-		}
-		# Strip ExcludedCommand in nested AutoCommandBars (references to standard commands invalid in extension)
+		$childItemsXml = [regex]::Replace($childItemsXml, '(?s)\s*<TypeLink>\s*<xr:DataPath\b[^>]*>Items\.[^<]*</xr:DataPath>.*?</TypeLink>', '')
+		$childItemsXml = Clear-BorrowedFormFragment $childItemsXml ([bool]$BorrowMainAttr)
 		$childItemsXml = [regex]::Replace($childItemsXml, '\s*<ExcludedCommand>[^<]*</ExcludedCommand>', '')
-		# Strip TypeLink blocks with human-readable DataPath (Items.XXX - can't convert to UUID)
-		$childItemsXml = [regex]::Replace($childItemsXml, '(?s)\s*<TypeLink>\s*<xr:DataPath>Items\.[^<]*</xr:DataPath>.*?</TypeLink>', '')
-		# Strip element-level Events (base form handlers not in extension)
 		$childItemsXml = [regex]::Replace($childItemsXml, '(?s)\s*<Events>.*?</Events>', '')
 
 		# Collect CommonPicture references from ChildItems and AutoCommandBar

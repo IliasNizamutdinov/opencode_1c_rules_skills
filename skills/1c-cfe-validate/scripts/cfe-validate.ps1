@@ -1128,8 +1128,9 @@ if (-not $ConfigPath) {
 			break
 		}
 		$reported = New-Object System.Collections.Generic.HashSet[string]
-		foreach ($m in [regex]::Matches($raw, '<(?:DataPath|TitleDataPath)>([^<]+)</(?:DataPath|TitleDataPath)>')) {
-			$path = $m.Groups[1].Value.Trim()
+		foreach ($m in [regex]::Matches($raw, '<((?:[A-Za-z_][\w.-]*:)?)([A-Za-z_](?:[\w.-]*DataPath|ataPath))\b[^>]*>([^<]*)</\1\2>')) {
+			if (-not $m.Groups[2].Value.EndsWith('DataPath')) { continue }
+			$path = $m.Groups[3].Value.Trim()
 			$segments = $path -split '\.'
 			if ($segments.Count -lt 2 -or $segments[0] -cne $mainName) { continue }
 			$first = $segments[1]
@@ -1202,6 +1203,24 @@ if ($addColCount -eq 0) {
 	Report-OK '15. AdditionalColumns: none found'
 } elseif ($check15Ok) {
 	Report-OK "15. AdditionalColumns: $addColCount table(s) borrowed"
+}
+
+# --- Check 16: путь данных в форме без основного реквизита ---
+$check16Ok = $true
+foreach ($bf in $script:borrowedFormsWithTree) {
+	$raw = $bf.RawText
+	$ctx = $bf.Context
+	if ($raw -match '<MainAttribute>true</MainAttribute>') { continue }
+	foreach ($m in [regex]::Matches($raw, '<((?:[A-Za-z_][\w.-]*:)?)([A-Za-z_](?:[\w.-]*DataPath|ataPath))\b[^>]*>([^<]*)</\1\2>')) {
+		if (-not $m.Groups[2].Value.EndsWith('DataPath')) { continue }
+		Report-Error ("16. ${ctx}: data path `"" + $m.Groups[3].Value.Trim() + "`" (" + $m.Groups[2].Value + ") in a borrowed form without a main attribute")
+		$check16Ok = $false
+	}
+}
+if ($script:borrowedFormsWithTree.Count -eq 0) {
+	Report-OK '16. Form data paths without main attribute: no borrowed forms with tree'
+} elseif ($check16Ok) {
+	Report-OK '16. Form data paths without main attribute: clean'
 }
 
 # --- Final output ---

@@ -460,6 +460,109 @@ def format_version_rank(version):
     return int(m.group(1)) * 100 + int(m.group(2)) if m else 0
 
 
+_DATA_PATH_OPEN = re.compile(
+    r'<(?:(?P<px>[A-Za-z_][\w.-]*):)?(?P<ln>[A-Za-z_](?:[\w.-]*DataPath|ataPath))\b(?P<attrs>[^>]*?)(?P<sc>/)?>'
+)
+_HAS_DATA_PATH = re.compile(
+    r'<(?:[A-Za-z_][\w.-]*:)?[A-Za-z_](?:[\w.-]*DataPath|ataPath)\b'
+)
+
+
+def _walk_back_ws(xml, i, start):
+    j = start
+    while j > i and xml[j - 1] in ' \t\r\n':
+        j -= 1
+    return j
+
+
+def strip_form_data_paths(xml, keep_object_paths=False):
+    """Удаляет элементы, локальное имя которых заканчивается на DataPath.
+
+    Префикс пространства имен и атрибуты не важны: покрыты DataPath, TitleDataPath,
+    RowPictureDataPath и xr:DataPath с любым xsi:type. При keep_object_paths
+    остаются значения, начинающиеся с 'Объект.' - режим -BorrowMainAttribute.
+    """
+    if not xml:
+        return xml
+    out = []
+    i = 0
+    n = len(xml)
+    while i < n:
+        m = _DATA_PATH_OPEN.search(xml, i)
+        if not m or not m.group('ln').endswith('DataPath'):
+            out.append(xml[i:])
+            break
+        start = m.start()
+        j = _walk_back_ws(xml, i, start)
+        if m.group('sc') == '/':
+            out.append(xml[i:j])
+            i = m.end()
+            continue
+        px = m.group('px')
+        close_name = f"{px}:{m.group('ln')}" if px else m.group('ln')
+        close = re.search(r'</' + re.escape(close_name) + r'>', xml[m.end():])
+        if not close:
+            out.append(xml[i:m.end()])
+            i = m.end()
+            continue
+        value = xml[m.end():m.end() + close.start()].strip()
+        end = m.end() + close.end()
+        if keep_object_paths and value.startswith('Объект.'):
+            out.append(xml[i:end])
+        else:
+            out.append(xml[i:j])
+        i = end
+    return ''.join(out)
+
+
+def _drop_blocks_without_data_path(xml, local_name):
+    """Убирает элемент local_name, внутри которого не осталось пути данных."""
+    if not xml:
+        return xml
+    open_rx = re.compile(
+        r'<(?:(?P<px>[A-Za-z_][\w.-]*):)?(?P<ln>' + re.escape(local_name) + r')\b(?P<attrs>[^>]*?)(?P<sc>/)?>'
+    )
+    out = []
+    i = 0
+    n = len(xml)
+    while i < n:
+        m = open_rx.search(xml, i)
+        if not m or m.group('ln') != local_name:
+            out.append(xml[i:])
+            break
+        start = m.start()
+        j = _walk_back_ws(xml, i, start)
+        if m.group('sc') == '/':
+            out.append(xml[i:j])
+            i = m.end()
+            continue
+        px = m.group('px')
+        close_name = f"{px}:{local_name}" if px else local_name
+        close = re.search(r'</' + re.escape(close_name) + r'>', xml[m.end():])
+        if not close:
+            out.append(xml[i:m.end()])
+            i = m.end()
+            continue
+        inner = xml[m.end():m.end() + close.start()]
+        end = m.end() + close.end()
+        if _HAS_DATA_PATH.search(inner):
+            out.append(xml[i:end])
+        else:
+            out.append(xml[i:j])
+        i = end
+    return ''.join(out)
+
+
+def clean_borrowed_form_fragment(xml, keep_object_paths=False):
+    """Зачистка путей данных в куске формы расширения."""
+    if not xml:
+        return xml
+    xml = strip_form_data_paths(xml, keep_object_paths=keep_object_paths)
+    xml = _drop_blocks_without_data_path(xml, 'Link')
+    xml = _drop_blocks_without_data_path(xml, 'ChoiceParameterLinks')
+    return xml
+
+
 def main():
     sys.stdout.reconfigure(encoding="utf-8")
     sys.stderr.reconfigure(encoding="utf-8")
@@ -1323,12 +1426,7 @@ def main():
             auto_cmd_xml = auto_cmd_xml.replace('<Autofill>true</Autofill>', '<Autofill>false</Autofill>')
             # Strip ExcludedCommand (references to standard commands invalid in extension)
             auto_cmd_xml = re.sub(r'\s*<ExcludedCommand>[^<]*</ExcludedCommand>', '', auto_cmd_xml)
-            # Strip DataPath in AutoCommandBar buttons
-            if borrow_main_attr:
-                # Keep only Объект.* DataPaths
-                auto_cmd_xml = re.sub(r'\s*<DataPath>(?!\u041e\u0431\u044a\u0435\u043a\u0442\.)[^<]*</DataPath>', '', auto_cmd_xml)
-            else:
-                auto_cmd_xml = re.sub(r'\s*<DataPath>[^<]*</DataPath>', '', auto_cmd_xml)
+            auto_cmd_xml = clean_borrowed_form_fragment(auto_cmd_xml, keep_object_paths=borrow_main_attr)
 
         # ChildItems: copy full tree, clean up base-config references
         child_items_xml = ""
@@ -1343,21 +1441,12 @@ def main():
             child_items_xml = ns_strip_pattern.sub("", child_items_xml)
             # Replace all CommandName values with 0
             child_items_xml = re.sub(r'<CommandName>[^<]*</CommandName>', '<CommandName>0</CommandName>', child_items_xml)
-            # Strip DataPath / TitleDataPath / RowPictureDataPath
-            if borrow_main_attr:
-                # Keep only Объект.* DataPaths - strip form-attribute DataPaths (not borrowed)
-                child_items_xml = re.sub(r'\s*<DataPath>(?!\u041e\u0431\u044a\u0435\u043a\u0442\.)[^<]*</DataPath>', '', child_items_xml)
-                child_items_xml = re.sub(r'\s*<TitleDataPath>(?!\u041e\u0431\u044a\u0435\u043a\u0442\.)[^<]*</TitleDataPath>', '', child_items_xml)
-                child_items_xml = re.sub(r'\s*<RowPictureDataPath>[^<]*</RowPictureDataPath>', '', child_items_xml)
-            else:
-                child_items_xml = re.sub(r'\s*<DataPath>[^<]*</DataPath>', '', child_items_xml)
-                child_items_xml = re.sub(r'\s*<TitleDataPath>[^<]*</TitleDataPath>', '', child_items_xml)
-                child_items_xml = re.sub(r'\s*<RowPictureDataPath>[^<]*</RowPictureDataPath>', '', child_items_xml)
-            # Strip ExcludedCommand in nested AutoCommandBars (references to standard commands invalid in extension)
+            # TypeLink с путем Items.* снимается целиком: путь человекочитаемый и в расширение не переводится.
+            child_items_xml = re.sub(
+                r'\s*<TypeLink>\s*<xr:DataPath\b[^>]*>Items\.[^<]*</xr:DataPath>.*?</TypeLink>',
+                '', child_items_xml, flags=re.DOTALL)
+            child_items_xml = clean_borrowed_form_fragment(child_items_xml, keep_object_paths=borrow_main_attr)
             child_items_xml = re.sub(r'\s*<ExcludedCommand>[^<]*</ExcludedCommand>', '', child_items_xml)
-            # Strip TypeLink blocks with human-readable DataPath (Items.XXX)
-            child_items_xml = re.sub(r'\s*<TypeLink>\s*<xr:DataPath>Items\.[^<]*</xr:DataPath>.*?</TypeLink>', '', child_items_xml, flags=re.DOTALL)
-            # Strip element-level Events
             child_items_xml = re.sub(r'\s*<Events>.*?</Events>', '', child_items_xml, flags=re.DOTALL)
 
             # Collect CommonPicture references from ChildItems and AutoCommandBar
